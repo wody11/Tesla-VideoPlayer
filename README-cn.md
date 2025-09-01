@@ -1,7 +1,5 @@
 # Tesla-VideoPlayer
-<div align="center">
-  <a href="README-cn.md">中文简介</a> | <a href="README.md">English</a>
-</div>
+
 一款**不依赖 `<video>`/MSE** 的播放器内核：
 **Worker 内部解复用** → **主线程 WebCodecs 解码** → **Canvas/WebGL 渲染** + **WebAudio 同步**。
 面向 HLS/MP4/FLV 等流的“轻内核、可插拔”实现。
