@@ -3,7 +3,9 @@
 一款**不依赖 `<video>`/MSE** 的播放器内核：
 **Worker 内部解复用** → **主线程 WebCodecs 解码** → **Canvas/WebGL 渲染** + **WebAudio 同步**。
 面向 HLS/MP4/FLV 等流的“轻内核、可插拔”实现。
+---
 支持特斯拉 model y,model x ,model3,model s等车型在驾驶过程中使用网页播放器进行流媒体播放。
+---
 > 适合需要更高可控性（精准时钟、画面/音频管线完全自管、无 `<video>` 黑箱）的场景。
 
 ---
