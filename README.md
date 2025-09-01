@@ -7,8 +7,9 @@
 A **no-`<video>`/no-MSE** playback core for the web:
 **Demux in a Worker** → **decode with WebCodecs on the main thread** → **render via Canvas/WebGL** + **sync with WebAudio**.
 Designed for HLS/MP4/FLV with a “small core, pluggable edges” philosophy.
+---
 You can enable web players to stream media while driving in various Tesla models, including the Model Y, Model X, Model 3, and Model S.
-
+---
 > Great when you need full control (precise clocking, fully owned AV pipeline, no `<video>` black box).
 
 ---
