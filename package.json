@@ -1,0 +1,23 @@
+{
+  "name": "browser-core-player",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+  "build:worker": "rollup -c rollup.config.js",
+  "build:demo": "rollup -c rollup.demo.config.js",
+  "build": "npm run build:worker",
+  "test": "jest --config jest.config.cjs --runInBand",
+    "lint": "echo 'lint placeholder'"
+  },
+  "devDependencies": {
+    "@rollup/plugin-commonjs": "^25.0.0",
+    "@rollup/plugin-node-resolve": "^15.0.0",
+    "@types/jest": "^30.0.0",
+    "jest": "^30.1.1",
+    "rollup": "^3.0.0",
+    "rollup-plugin-typescript2": "^0.34.0",
+    "ts-jest": "^29.4.1",
+    "typescript": "^4.9.5"
+  }
+}
