@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WebCodecs Canvas Player – Full</title>
+  <link rel="icon" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect fill="%230b0b10" width="64" height="64"/><path fill="%23ffffff" d="M24 18 L48 32 L24 46 Z"/></svg>' />
+  <style>
+    :root { --bg: #0b0b10; --fg: #fff; --muted:#a3a3ad; --accent:#7c3aed; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; background: var(--bg); color: var(--fg); }
+    .player { position:relative; width: min(100vw, 1200px); height: min(67.5vw, 675px); margin: 24px auto; background:#000; border-radius:12px; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,.35); }
+    canvas { width:100%; height:100%; display:block; background:#000; }
+    .controls { position:absolute; inset: auto 0 0 0; padding: 10px; background: linear-gradient(to top, rgba(0,0,0,.55), transparent); display:flex; flex-direction:column; gap:8px; opacity:.98; transition: opacity .2s ease; }
+    .row { display:flex; align-items:center; gap:10px; }
+    button, .chip { appearance:none; border:none; background:rgba(255,255,255,.08); color:#fff; padding:8px 10px; border-radius:8px; cursor:pointer; line-height:0; display:inline-flex; align-items:center; justify-content:center; gap:8px; }
+    button:hover { background: rgba(255,255,255,.14); }
+    .time { font-variant-numeric: tabular-nums; color:#fff9; }
+    input[type="range"] { width: 160px; }
+    .progress { position:relative; width:100%; height:6px; background:rgba(255,255,255,.2); border-radius:999px; cursor:pointer; }
+    .bar { position:absolute; inset:0 auto 0 0; height:100%; width:0%; background:var(--accent); border-radius:999px; }
+    .loading { position:absolute; inset: 0; display:grid; place-items:center; pointer-events:none; }
+    .spinner { width:52px; height:52px; border:4px solid rgba(255,255,255,.18); border-top-color:#fff; border-radius:50%; animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .panel { position:absolute; right:10px; bottom:64px; width:360px; max-width:calc(100% - 20px); background: rgba(20,20,28,.96); border:1px solid rgba(255,255,255,.08); border-radius:12px; padding:12px; display:none; }
+    .panel h3 { margin:6px 0 10px; font-size:14px; color:#fff; opacity:.85; }
+    .panel .row { justify-content:space-between; }
+    .kv { display:flex; align-items:center; gap:10px; }
+    .vv { color:#fff9; font-size:13px; }
+    .hidden { display:none !important; }
+    .badge { font-size:12px; padding:4px 8px; border-radius:999px; background:rgba(255,255,255,.08); }
+  </style>
+</head>
+<body>
+  <div class="player" id="player">
+    <canvas id="cv" width="1280" height="720"></canvas>
+  <!-- MSE Fallback video element -->
+
+    <div class="loading hidden" id="loading"><div class="spinner"></div></div>
+
+    <div class="controls" id="controls">
+      <div class="progress" id="progress"><div class="bar" id="bar"></div></div>
+      <div class="row">
+        <button id="play" title="播放/暂停">▶</button>
+        <div class="kv">
+          <button id="mute" title="静音">🔊</button>
+          <input id="vol" type="range" min="0" max="1" step="0.01" value="1" />
+        </div>
+        <span class="time" id="time">00:00 / 00:00</span>
+        <div style="flex:1"></div>
+        <span class="vv">Demux:</span><span class="badge" id="demuxKind">—</span>
+  <span class="vv">缓冲:</span><span class="badge" id="bufInfo">0 帧</span>
+  <span class="vv">漂移:</span><span class="badge" id="driftInfo">0 ms</span>
+        <span class="vv">音频:</span><span class="badge" id="audioMode">WC</span>
+        <button id="gear" title="设置">⚙️</button>
+        <button id="fs" title="全屏">⛶</button>
+      </div>
+    </div>
+
+    <div class="panel" id="panel">
+      <h3>设置</h3>
+      <div class="row"><span class="vv">视频 WebCodecs</span><label><input type="checkbox" id="videoWC" checked/> 启用</label></div>
+      <div class="row"><span class="vv">音频 WebCodecs</span><label><input type="checkbox" id="audioWC" checked/> 启用</label></div>
+  <!-- HLS MSE 回退选项已移除，保持纯 WebCodecs+Canvas 渲染 -->
+      <div class="row"><span class="vv">渲染</span>
+        <select id="renderer">
+          <option value="webgl" selected>WebGL</option>
+          <option value="2d">Canvas2D</option>
+        </select>
+      </div>
+      <div class="row"><span class="vv">解复用</span><span class="vv" id="demuxInfo">—</span></div>
+  <div class="row"><label><input type="checkbox" id="usePCR" checked/> 音频建立前使用 PCR</label></div>
+  <div class="row"><label><input type="checkbox" id="contTimeline" checked/> 连续时间轴</label></div>
+      <div class="row"><span class="vv">lookAhead(ms)</span><input id="lookAhead" type="number" min="0" step="10" value="80" style="width:90px"/></div>
+      <div class="row"><span class="vv">dropWindow(ms)</span><input id="dropWindow" type="number" min="0" step="10" value="120" style="width:90px"/></div>
+      <div class="row"><span class="vv">leadWindow(ms)</span><input id="leadWindow" type="number" min="0" step="10" value="200" style="width:90px"/></div>
+      <div class="row"><span class="vv">stall(ahead s)</span><input id="stallAhead" type="number" min="0" step="0.01" value="0.03" style="width:90px"/></div>
+      <div class="row"><span class="vv">stall(idle ms)</span><input id="stallIdle" type="number" min="0" step="10" value="500" style="width:90px"/></div>
+      <div class="row"><span class="vv">inFlight</span><input id="inFlight" type="number" min="1" step="1" value="6" style="width:90px"/></div>
+      <div class="row"><span class="vv">queueMax</span><input id="queueMax" type="number" min="30" step="10" value="180" style="width:90px"/></div>
+      <div class="row"><span class="vv">bootstrap(ms,frames)</span>
+        <input id="bootMs" type="number" min="0" step="10" value="500" style="width:80px"/>
+        <input id="bootFrames" type="number" min="0" step="1" value="20" style="width:60px"/>
+      </div>
+      <div class="row"><span class="vv">速率</span><input id="rate" type="range" min="0.5" max="2" step="0.05" value="1"/></div>
+      <div class="row"><span class="vv">起播(ms)</span><input id="startAt" type="number" min="0" step="1000" value="0" style="width:120px"/></div>
+      <div class="row"><button id="apply">应用</button><button id="goLive">追直播</button></div>
+    </div>
+  </div>
+
+  <!-- Inline log panel for demo -->
+  <div id="consoleLog" style="width:min(100%,1200px); margin:8px auto; padding:8px 12px; max-height:160px; overflow:auto; background:#07070b; border-radius:8px; border:1px solid rgba(255,255,255,.04); font-family: monospace; font-size:12px; color:#d6d6d8"></div>
+
+  <div class="row" style="width:min(100%,1200px); margin:8px auto 12px; padding:0 12px; gap:8px;">
+    <input id="url" placeholder="输入 MP4 或 HLS(m3u8) URL…" style="flex:1; padding:10px; border-radius:10px; border:1px solid #2a2a35; background:#13131a; color:#fff;" />
+    <button id="load" class="chip">加载</button>
+    <button id="demo" class="chip">示例</button>
+  </div>
+  <div class="row" style="width:min(100%,1200px); margin:0 auto 24px; padding:0 12px; gap:8px; color:#fff9; font-size:13px;">
+    <span>首帧</span><span id="kpiFirst" class="badge">—</span>
+    <span>卡顿次数</span><span id="kpiRbCnt" class="badge">0</span>
+    <span>卡顿时长</span><span id="kpiRbDur" class="badge">0 ms</span>
+    <span>漂移p50</span><span id="kpiP50" class="badge">0 ms</span>
+    <span>漂移p95</span><span id="kpiP95" class="badge">0 ms</span>
+    <span>丢帧</span><span id="kpiDrop" class="badge">0</span>
+  </div>
+
+<script>
+  // 动态附加时间戳，避免浏览器缓存旧的 demo.js
+  (function(){
+    var s = document.createElement('script');
+  // 始终生成全新的 bust，防止 LiveReload 部分刷新时复用旧值
+  var v = Date.now().toString(36) + '.' + Math.random().toString(36).slice(2);
+  s.src = 'demo/dist/demo.js?v=' + v;
+    document.currentScript ? document.currentScript.after(s) : document.body.appendChild(s);
+  })();
+</script>
+<script>
+  // PlayerCore is exposed by demo bundle
+  window.__DEMO_DEBUG = true;
+  // Minimal boot helper (pure JavaScript, no TS assertions)
+  window.bootDemo = () => {
+    const canvas = document.getElementById('cv');
+  const pc = new window.PlayerCore({ canvas, renderer: 'webgl' });
+    // set a demo URL or use input
+    const urlEl = document.getElementById('url');
+    const url = (urlEl && urlEl.value) || '';
+    if (url) pc.load(url);
+    window.__pc = pc;
+  };
+  (function(){
+    const $load = document.getElementById('load');
+    const $demo = document.getElementById('demo');
+    const $url = document.getElementById('url');
+    const canvas = document.getElementById('cv');
+    const $time = document.getElementById('time');
+    const $bufInfo = document.getElementById('bufInfo');
+    const $bar = document.getElementById('bar');
+  const $play = document.getElementById('play');
+  const $mute = document.getElementById('mute');
+  const $vol = document.getElementById('vol');
+  const $fs = document.getElementById('fs');
+  const $gear = document.getElementById('gear');
+  const $panel = document.getElementById('panel');
+  const $progress = document.getElementById('progress');
+  const $loading = document.getElementById('loading');
+  const $driftInfo = document.getElementById('driftInfo');
+  const $renderer = document.getElementById('renderer');
+  // KPI 面板元素
+  const $kFirst = document.getElementById('kpiFirst');
+  const $kRbCnt = document.getElementById('kpiRbCnt');
+  const $kRbDur = document.getElementById('kpiRbDur');
+  const $kP50 = document.getElementById('kpiP50');
+  const $kP95 = document.getElementById('kpiP95');
+  const $kDrop = document.getElementById('kpiDrop');
+  // 设置面板元素
+  const $lookAhead = document.getElementById('lookAhead');
+  const $dropWindow = document.getElementById('dropWindow');
+  const $leadWindow = document.getElementById('leadWindow');
+  const $stallAhead = document.getElementById('stallAhead');
+  const $stallIdle = document.getElementById('stallIdle');
+  const $inFlight = document.getElementById('inFlight');
+  const $queueMax = document.getElementById('queueMax');
+  const $bootMs = document.getElementById('bootMs');
+  const $bootFrames = document.getElementById('bootFrames');
+  const $rate = document.getElementById('rate');
+  const $startAt = document.getElementById('startAt');
+  const $apply = document.getElementById('apply');
+  const $goLive = document.getElementById('goLive');
+  const $usePCR = document.getElementById('usePCR');
+  const $contTimeline = document.getElementById('contTimeline');
+
+    function fmt(ms){
+      ms = Math.max(0, Math.floor(ms||0));
+      const s = Math.floor(ms/1000);
+      const hh = Math.floor(s/3600);
+      const mm = Math.floor((s%3600)/60);
+      const ss = s%60;
+      const H = hh>0? (hh.toString()+':') : '';
+      return H + mm.toString().padStart(2,'0') + ':' + ss.toString().padStart(2,'0');
+    }
+
+    // 周期刷新时间与缓冲信息
+    if (!window.__demoUiTimer) {
+      window.__demoUiTimer = setInterval(()=>{
+        try {
+          const pc = window._playerCore;
+          if (pc && typeof pc.getCurrentTimeMs === 'function') {
+            const ms = pc.getCurrentTimeMs();
+            const dur = (pc.getDurationMs && pc.getDurationMs()) || 0;
+            if ($time) $time.textContent = dur > 0 ? `${fmt(ms||0)} / ${fmt(dur)}` : `${fmt(ms||0)} / LIVE`;
+          }
+          if (pc && typeof pc.getStats === 'function') {
+            const st = pc.getStats();
+            if ($bufInfo) $bufInfo.textContent = `${st.videoQueue||0} 帧`;
+            if ($driftInfo && typeof pc.getVideoDriftUs === 'function') {
+              const du = pc.getVideoDriftUs();
+              const ms = (typeof du === 'number') ? Math.round(du/1000) : 0;
+              $driftInfo.textContent = ms + ' ms';
+            }
+            const dur = (pc.getDurationMs && pc.getDurationMs()) || 0;
+            if ($bar) {
+              let pct = 0;
+              if (dur > 0) {
+                const ms = (pc.getCurrentTimeMs && pc.getCurrentTimeMs()) || 0;
+                pct = Math.max(0, Math.min(100, (ms/dur)*100));
+              } else if (st && st.videoQueue!==undefined) {
+                pct = Math.max(0, Math.min(100, (st.videoQueue/300)*100));
+              }
+              $bar.style.width = pct.toFixed(0) + '%';
+            }
+          }
+        } catch {}
+      }, 200);
+    }
+    // 等待 PlayerCore 出现（解决脚本加载竞态）
+    async function waitForPlayerCore(msTotal = 200, step = 50) {
+      const deadline = Date.now() + msTotal;
+      while (Date.now() < deadline) {
+        if (window.PlayerCore) return true;
+        await new Promise(r => setTimeout(r, step));
+      }
+      return !!window.PlayerCore;
+    }
+
+    $demo.addEventListener('click', ()=>{
+      $url.value = 'https://storage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4';
+    });
+
+    $load.addEventListener('click', async (ev)=>{
+      try { ev && ev.preventDefault && ev.preventDefault(); } catch(e){}
+      const u = ($url.value||'').trim();
+      if (!u) return alert('请输入 MP4 / M3U8 地址');
+      // 如果已选择 PlayerCore 模式，直接复用并返回
+      if (window.__demoUsingPlayerCore && window._playerCore && window.PlayerCore) {
+        try { await window._playerCore.load(u); await window._playerCore.play(); } catch(e){}
+        return;
+      }
+
+      // If project exposes PlayerCore (src/core/player-core.ts) on window, use it.
+      // 增加短暂等待，避免脚本竞态导致误判
+      if (!window.PlayerCore) {
+        await waitForPlayerCore(300, 50);
+      }
+      if (window.PlayerCore) {
+        try {
+            const PlayerCore = window.PlayerCore;
+          // 复用已存在的实例，避免重复初始化
+            const p = window._playerCore instanceof PlayerCore ? window._playerCore : new PlayerCore({ canvas });
+            window._playerCore = p;
+            // 绑定控制
+            if ($play && !$play.__bound) { $play.__bound = true; $play.addEventListener('click', async ()=>{ try { if (window.__playingToggle) { await p.pause(); window.__playingToggle=false; $play.textContent='▶'; } else { await p.play(); window.__playingToggle=true; $play.textContent='⏸'; } } catch{} }); }
+            if ($mute && !$mute.__bound) { $mute.__bound = true; $mute.addEventListener('click', ()=>{ window.__mutedToggle = !window.__mutedToggle; p.setMuted(!!window.__mutedToggle); $mute.textContent = window.__mutedToggle?'🔇':'🔊'; }); }
+            if ($vol && !$vol.__bound) { $vol.__bound = true; $vol.addEventListener('input', ()=>{ const v = parseFloat($vol.value||'1'); p.setVolume(v); }); }
+            if ($fs && !$fs.__bound) {
+              $fs.__bound = true;
+              $fs.addEventListener('click', ()=>{
+                const host = document.getElementById('player');
+                const docAny = document;
+                const enter = host.requestFullscreen || host.webkitRequestFullscreen || host.msRequestFullscreen || host.mozRequestFullScreen;
+                const exit = document.exitFullscreen || docAny.webkitExitFullscreen || docAny.msExitFullscreen || docAny.mozCancelFullScreen;
+                const isFs = document.fullscreenElement || docAny.webkitFullscreenElement || docAny.msFullscreenElement || docAny.mozFullScreenElement;
+                if (!isFs && enter) enter.call(host); else if (isFs && exit) exit.call(document);
+              });
+              document.addEventListener('fullscreenchange', ()=>{ try { $fs.textContent = '⛶'; } catch{} });
+            }
+            if (canvas && !canvas.__fsdbl) { canvas.__fsdbl = true; canvas.addEventListener('dblclick', ()=>{ $fs.click(); }); }
+            // 设置面板开关
+            if ($gear && !$gear.__bound) {
+              $gear.__bound = true;
+              $gear.addEventListener('click', (ev)=>{
+                try { ev.stopPropagation(); } catch {}
+                if ($panel) {
+                  const shown = $panel.style.display !== 'none' && $panel.style.display !== '' ? true : ($panel.style.display === 'block');
+                  $panel.style.display = shown ? 'none' : 'block';
+                }
+              });
+              // 点击播放器外空白隐藏
+              document.addEventListener('click', (ev)=>{
+                try {
+                  if (!$panel || $panel.style.display !== 'block') return;
+                  const host = document.getElementById('player');
+                  if (host && !host.contains(ev.target)) { $panel.style.display = 'none'; }
+                } catch {}
+              });
+              // ESC 关闭
+              document.addEventListener('keydown', (ev)=>{ try { if (ev.key === 'Escape' && $panel && $panel.style.display === 'block') $panel.style.display = 'none'; } catch {} });
+            }
+            // 设置项绑定
+            if ($renderer && !$renderer.__bound) {
+              $renderer.__bound = true;
+              $renderer.addEventListener('change', ()=>{ try { p.setRenderer($renderer.value); } catch {} });
+            }
+            // 绑定核心事件，控制 loading 与播放键图标
+            if (!p.__demoEventsBound) {
+              p.__demoEventsBound = true;
+              try {
+                p.on && p.on('buffering', ()=>{ try { if ($loading) $loading.classList.remove('hidden'); if ($play) $play.textContent='▶'; } catch {} });
+                p.on && p.on('playing', ()=>{ try { if ($loading) $loading.classList.add('hidden'); if ($play && window.__playingToggle) $play.textContent='⏸'; } catch {} });
+                p.on && p.on('ended', ()=>{ try { if ($loading) $loading.classList.add('hidden'); if ($play) { $play.textContent='▶'; window.__playingToggle=false; } } catch {} });
+                // 降低非致命错误（如 lazy VideoDecoder 配置失败）的噪音等级
+                p.on && p.on('error', (e)=>{ try { console.info('player info', e); } catch {} });
+                // stats 推送，更新 KPI 面板
+                p.on && p.on('stats', (st)=>{
+                  try {
+                    if ($kFirst) $kFirst.textContent = (st.firstFrameTimeMs!==undefined)? (Math.round(st.firstFrameTimeMs)+' ms') : '—';
+                    if ($kRbCnt) $kRbCnt.textContent = String(st.rebufferCount||0);
+                    if ($kRbDur) $kRbDur.textContent = String(st.rebufferDurationMs||0)+' ms';
+                    if ($kP50) $kP50.textContent = String(st.driftP50Ms||0)+' ms';
+                    if ($kP95) $kP95.textContent = String(st.driftP95Ms||0)+' ms';
+                    if ($kDrop) $kDrop.textContent = String(st.framesDropped||0);
+                  } catch {}
+                });
+              } catch {}
+            }
+            if ($apply && !$apply.__bound) {
+              $apply.__bound = true;
+              $apply.addEventListener('click', ()=>{
+                try {
+                  const la = parseFloat($lookAhead.value||'80'); p.setLookAheadMs(la);
+                  const dr = parseFloat($dropWindow.value||'120'); p.setDropWindowMs(dr);
+                  const ld = parseFloat($leadWindow.value||'200'); p.setLeadWindowMs(ld);
+                  const sa = parseFloat($stallAhead.value||'0.03'); const si = parseInt($stallIdle.value||'500'); p.setStallThresholds(sa, si);
+                  const ifl = parseInt($inFlight.value||'6'); p.setMaxVideoInFlight(ifl);
+                  const qm = parseInt($queueMax.value||'180'); p.setMaxVideoQueue(qm);
+                  const bm = parseFloat($bootMs.value||'500'); const bf = parseInt($bootFrames.value||'20'); p.setBootstrapFeed(bm, bf);
+                  const rt = parseFloat($rate.value||'1'); p.setPlaybackRate(rt);
+                  const st = parseInt($startAt.value||'0'); p.setStartPositionMs(st>=0?st:undefined);
+                  if ($usePCR) p.setUsePcrBeforeAudio(!!$usePCR.checked);
+                  if ($contTimeline) p.setContinuousTimeline(!!$contTimeline.checked);
+                } catch {}
+              });
+            }
+            if ($goLive && !$goLive.__bound) { $goLive.__bound = true; $goLive.addEventListener('click', ()=>{ try { p.goLive(); } catch {} }); }
+            if ($progress && !$progress.__bound) {
+              $progress.__bound = true;
+              $progress.addEventListener('click', async (ev)=>{
+                try {
+                  const dur = p.getDurationMs && p.getDurationMs(); if (!dur || dur<=0) return; // 直播不支持点击跳转
+                  const rect = $progress.getBoundingClientRect();
+                  const x = (ev.clientX - rect.left) / rect.width; const ms = Math.max(0, Math.min(1, x)) * dur;
+                  await p.seek(Math.floor(ms));
+                } catch {}
+              });
+            }
+          window.__demoUsingPlayerCore = true;
+          // 如存在旧的回退 worker，则终止
+            if (window._fallbackWorker && typeof window._fallbackWorker.terminate === 'function') {
+              try { window._fallbackWorker.terminate(); } catch(e){}
+              window._fallbackWorker = null;
+          }
+          // 先应用面板默认值再加载
+          try {
+            if ($usePCR) p.setUsePcrBeforeAudio(!!$usePCR.checked);
+            if ($contTimeline) p.setContinuousTimeline(!!$contTimeline.checked);
+            if ($lookAhead) p.setLookAheadMs(parseFloat($lookAhead.value||'80'));
+            if ($dropWindow) p.setDropWindowMs(parseFloat($dropWindow.value||'120'));
+            if ($leadWindow) p.setLeadWindowMs(parseFloat($leadWindow.value||'200'));
+            if ($stallAhead && $stallIdle) p.setStallThresholds(parseFloat($stallAhead.value||'0.03'), parseInt($stallIdle.value||'500'));
+            if ($inFlight) p.setMaxVideoInFlight(parseInt($inFlight.value||'6'));
+            if ($queueMax) p.setMaxVideoQueue(parseInt($queueMax.value||'180'));
+            if ($bootMs && $bootFrames) p.setBootstrapFeed(parseFloat($bootMs.value||'500'), parseInt($bootFrames.value||'20'));
+            if ($rate) p.setPlaybackRate(parseFloat($rate.value||'1'));
+            if ($startAt) p.setStartPositionMs(parseInt($startAt.value||'0'));
+          } catch {}
+          await p.load(u);
+          await p.play();
+            try { if (window.__DEMO_DEBUG) console.log('PlayerCore used for demo'); } catch (e) {}
+          return;
+        } catch (e) {
+          try { console.warn('PlayerCore usage failed', e && (e.stack || e.message || e)); } catch {}
+          alert('PlayerCore 初始化失败，请查看控制台日志。不会回退到 MSE/worker。');
+          return;
+        }
+      } else {
+        // 为避免混淆，演示页面不再回退到 worker 直放。若 PlayerCore 不可用，给出提示。
+        alert('未找到可用的 PlayerCore（demo/dist/demo.js）。请先执行 demo 构建，或刷新后重试。');
+        return;
+      }
+    });
+  })();
+</script>
+</body>
+</html>
