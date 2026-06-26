@@ -1,7 +1,8 @@
-import { PlayerCore } from './core/player-core';
+import { TeslaStandalonePlayer } from './core/tesla-standalone-player';
 
-// Tiny bootstrap (for dev)
-(window as any).createPlayer = function(opts: any) {
-  const canvas = document.querySelector('canvas') as HTMLCanvasElement;
-  return new PlayerCore({ canvas });
+export { TeslaStandalonePlayer } from './core/tesla-standalone-player';
+
+(window as any).TeslaStandalonePlayer = TeslaStandalonePlayer;
+(window as any).createTeslaPlayer = function(opts: any) {
+  return new TeslaStandalonePlayer(opts);
 };

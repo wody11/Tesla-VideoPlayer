@@ -1,9 +1,13 @@
 import resolve from '@rollup/plugin-node-resolve';
 import commonjs from '@rollup/plugin-commonjs';
-import typescript from 'rollup-plugin-typescript2';
+import typescript from '@rollup/plugin-typescript';
 
 export default {
-  input: 'src/worker/index.ts',
+  input: {
+    index: 'src/index.ts',
+    worker: 'src/worker/index.ts',
+    'http-flv-worker': 'src/worker/http-flv-worker.ts'
+  },
   output: {
     dir: 'dist',
     format: 'es',
@@ -11,8 +15,8 @@ export default {
     entryFileNames: '[name].js'
   },
   plugins: [
+  typescript({ tsconfig: './tsconfig.json' }),
     resolve({ browser: true }),
-    commonjs(),
-  typescript({ tsconfig: './tsconfig.json', clean: true })
+    commonjs()
   ]
 };

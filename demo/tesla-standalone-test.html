@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tesla Standalone Stream Test</title>
+  <style>
+    html, body {
+      height: 100%;
+      overflow: hidden;
+    }
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #0f1115;
+      color: #e8e8e8;
+    }
+    .app {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 360px;
+      gap: 12px;
+      height: 100vh;
+      padding: 12px;
+      box-sizing: border-box;
+    }
+    .viewer {
+      min-width: 0;
+      min-height: 0;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      gap: 8px;
+    }
+    .topbar {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto auto;
+      gap: 8px;
+      align-items: center;
+    }
+    #stage {
+      width: 100%;
+      height: 100%;
+      min-height: 0;
+      background: #000;
+      border: 1px solid #2d3440;
+      overflow: hidden;
+    }
+    .panel {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      min-height: 0;
+      overflow: auto;
+      padding-right: 2px;
+    }
+    fieldset {
+      border: 1px solid #2d3440;
+      margin: 0;
+      padding: 10px;
+    }
+    legend {
+      color: #9fb3c8;
+      padding: 0 4px;
+    }
+    label {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+      align-items: center;
+      margin: 6px 0;
+      font-size: 13px;
+    }
+    input, select, button {
+      font: inherit;
+      padding: 8px;
+      border: 1px solid #3b4654;
+      background: #171b22;
+      color: #e8e8e8;
+      box-sizing: border-box;
+      min-width: 0;
+    }
+    button {
+      cursor: pointer;
+      background: #223044;
+    }
+    .row {
+      display: flex;
+      gap: 8px;
+    }
+    .row button {
+      flex: 1;
+    }
+    pre {
+      margin: 0;
+      min-height: 92px;
+      max-height: 190px;
+      overflow: auto;
+      padding: 10px;
+      background: #080a0f;
+      border: 1px solid #2d3440;
+      white-space: pre-wrap;
+      font-size: 12px;
+    }
+    .metric {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+      font-size: 13px;
+    }
+    @media (max-width: 900px) {
+      html, body { overflow: auto; }
+      .app {
+        grid-template-columns: 1fr;
+        height: auto;
+        min-height: 100vh;
+      }
+      .viewer { height: 62vh; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="viewer">
+      <div class="topbar">
+        <input id="url" placeholder="HTTP-FLV .flv or HLS .m3u8 URL">
+        <button id="play">Play</button>
+        <button id="pause">Pause</button>
+        <button id="stop">Stop</button>
+      </div>
+      <div id="stage"></div>
+    </div>
+    <div class="panel">
+      <fieldset>
+        <legend>Display</legend>
+        <label>Renderer          <select id="renderer">
+            <option value="webgl">WebGL</option>
+            <option value="canvas2d">Canvas 2D</option>
+          </select>
+        </label>
+        <label>Fit mode
+          <select id="fitMode">
+            <option value="contain">Contain</option>
+            <option value="cover">Cover</option>
+            <option value="fill">Fill</option>
+          </select>
+        </label>
+      </fieldset>
+      <fieldset>
+        <legend>Playback strategy</legend>
+        <label>Preset
+          <select id="preset">
+            <option value="balanced">Balanced</option>
+            <option value="low-latency">Low latency</option>
+            <option value="smooth">Smooth</option>
+          </select>
+        </label>
+        <label>Audio queue ms <input id="audioMaxQueueMs" type="number" min="300" max="5000" step="100" value="1500"></label>
+        <label>Decode batch <input id="decodeBatchSize" type="number" min="1" max="24" step="1" value="8"></label>
+        <label>Render queue <input id="maxRenderQueue" type="number" min="30" max="240" step="10" value="120"></label>
+        <label>Late drop ms <input id="lateDropMs" type="number" min="80" max="1000" step="20" value="240"></label>
+        <label>Startup segments <input id="liveStartSegmentCount" type="number" min="1" max="3" step="1" value="1"></label>
+        <label>Segments per poll <input id="liveSegmentBatch" type="number" min="1" max="3" step="1" value="1"></label>
+      </fieldset>
+      <fieldset>
+        <legend>Audio</legend>
+        <label>Volume <input id="volume" type="range" min="0" max="1" step="0.01" value="1"></label>
+      </fieldset>
+      <div class="metric">State<strong id="state">idle</strong></div>
+      <div class="metric">video tags <strong id="videoCount">0</strong></div>
+      <div class="metric">canvas tags <strong id="canvasCount">0</strong></div>
+      <pre id="stats">{}</pre>
+      <pre id="log"></pre>
+    </div>
+  </div>
+  <script type="module">
+    import { TeslaStandalonePlayer } from '../dist/index.js';
+
+    const stage = document.getElementById('stage');
+    const url = document.getElementById('url');
+    const renderer = document.getElementById('renderer');
+    const state = document.getElementById('state');
+    const stats = document.getElementById('stats');
+    const log = document.getElementById('log');
+    const videoCount = document.getElementById('videoCount');
+    const canvasCount = document.getElementById('canvasCount');
+    const presets = {
+      'low-latency': { audioMaxQueueMs: 900, decodeBatchSize: 10, maxRenderQueue: 80, lateDropMs: 160, liveStartSegmentCount: 1, liveSegmentBatch: 1 },
+      balanced: { audioMaxQueueMs: 1500, decodeBatchSize: 8, maxRenderQueue: 120, lateDropMs: 240, liveStartSegmentCount: 1, liveSegmentBatch: 1 },
+      smooth: { audioMaxQueueMs: 2600, decodeBatchSize: 6, maxRenderQueue: 180, lateDropMs: 420, liveStartSegmentCount: 2, liveSegmentBatch: 1 }
+    };
+    const settingIds = ['preset', 'fitMode', 'audioMaxQueueMs', 'decodeBatchSize', 'maxRenderQueue', 'lateDropMs', 'liveStartSegmentCount', 'liveSegmentBatch'];
+    const getSettings = () => ({
+      preset: document.getElementById('preset').value,
+      fitMode: document.getElementById('fitMode').value,
+      audioMaxQueueMs: document.getElementById('audioMaxQueueMs').valueAsNumber,
+      decodeBatchSize: document.getElementById('decodeBatchSize').valueAsNumber,
+      maxRenderQueue: document.getElementById('maxRenderQueue').valueAsNumber,
+      lateDropMs: document.getElementById('lateDropMs').valueAsNumber,
+      liveStartSegmentCount: document.getElementById('liveStartSegmentCount').valueAsNumber,
+      liveSegmentBatch: document.getElementById('liveSegmentBatch').valueAsNumber
+    });
+    let player = new TeslaStandalonePlayer({ container: stage, renderer: renderer.value, ...getSettings() });
+
+    function bind(p) {
+      p.on('state', value => state.textContent = value);
+      p.on('error', error => {
+        log.textContent += `[error] ${error.message}\n`;
+        log.scrollTop = log.scrollHeight;
+      });
+      p.on('log', message => {
+        log.textContent += `[log] ${message}\n`;
+        log.scrollTop = log.scrollHeight;
+      });
+      p.on('firstFrame', ms => {
+        log.textContent += `[first-frame] ${ms}ms\n`;
+        log.scrollTop = log.scrollHeight;
+      });
+    }
+    bind(player);
+
+    renderer.addEventListener('change', () => player.setRenderer(renderer.value));
+    document.getElementById('preset').addEventListener('change', event => {
+      const preset = presets[event.target.value];
+      if (preset) {
+        for (const [key, value] of Object.entries(preset)) document.getElementById(key).value = value;
+      }
+      player.updateSettings(getSettings());
+    });
+    for (const id of settingIds) {
+      document.getElementById(id).addEventListener('change', () => player.updateSettings(getSettings()));
+      document.getElementById(id).addEventListener('input', () => player.updateSettings(getSettings()));
+    }
+    document.getElementById('volume').addEventListener('input', event => player.setVolume(event.target.valueAsNumber));
+    document.getElementById('play').addEventListener('click', async () => {
+      try {
+        player.updateSettings(getSettings());
+        await player.play(url.value.trim());
+      } catch (error) {
+        log.textContent += `[error] ${error.message || error}\n`;
+      }
+    });
+    document.getElementById('pause').addEventListener('click', async () => {
+      if (state.textContent === 'paused') await player.resume();
+      else player.pause();
+    });
+    document.getElementById('stop').addEventListener('click', () => player.stop());
+
+    setInterval(() => {
+      const snapshot = player.getStats();
+      stats.textContent = JSON.stringify(snapshot, null, 2);
+      videoCount.textContent = String(document.querySelectorAll('video').length);
+      canvasCount.textContent = String(document.querySelectorAll('canvas').length);
+    }, 500);
+  </script>
+</body>
+</html>
