@@ -9,6 +9,9 @@ export class WebAudioPlayer {
   private sources = new Set<AudioBufferSourceNode>();
   private targetQueueMs = 1500;
   private hardResetQueueMs = 7000;
+  private enqueuedFrames = 0;
+  private lastFrameSamples = 0;
+  private lastTimestampUs = 0;
 
   constructor() {
     const Ctor = (window as any).AudioContext || (window as any).webkitAudioContext;
@@ -34,7 +37,7 @@ export class WebAudioPlayer {
 
   setMaxQueueMs(value: number): void {
     this.targetQueueMs = Math.max(300, Math.min(5000, Number(value) || 1500));
-    this.hardResetQueueMs = Math.max(this.targetQueueMs * 3, this.targetQueueMs + 3000);
+    this.hardResetQueueMs = Math.max(this.targetQueueMs * 2, this.targetQueueMs + 1000);
   }
 
   enqueue(frame: any): void {
@@ -44,6 +47,9 @@ export class WebAudioPlayer {
     const frames = frame.numberOfFrames || 0;
     const sampleRate = frame.sampleRate || this.context.sampleRate;
     const timestamp = typeof frame.timestamp === 'number' ? frame.timestamp : 0;
+    this.enqueuedFrames += 1;
+    this.lastFrameSamples = frames;
+    this.lastTimestampUs = timestamp;
 
     if (this.queuedMs() > this.hardResetQueueMs) {
       this.stopScheduledSources();
@@ -68,7 +74,7 @@ export class WebAudioPlayer {
     source.buffer = audioBuffer;
     const queueMs = this.queuedMs();
     const catchupRate = queueMs > this.targetQueueMs
-      ? Math.min(1.08, 1 + ((queueMs - this.targetQueueMs) / Math.max(this.targetQueueMs, 1)) * 0.04)
+      ? Math.min(1.12, 1 + ((queueMs - this.targetQueueMs) / Math.max(this.targetQueueMs, 1)) * 0.06)
       : 1;
     source.playbackRate.setValueAtTime(catchupRate, this.context.currentTime);
     source.connect(this.gain);
@@ -97,6 +103,22 @@ export class WebAudioPlayer {
     const target = this.clock.targetContextTime(mediaUs);
     if (target === undefined) return undefined;
     return (target - this.context.currentTime) * 1000;
+  }
+
+  diagnostics(): {
+    contextState: AudioContextState;
+    enqueuedFrames: number;
+    scheduledSources: number;
+    lastFrameSamples: number;
+    lastTimestampUs: number;
+  } {
+    return {
+      contextState: this.context.state,
+      enqueuedFrames: this.enqueuedFrames,
+      scheduledSources: this.sources.size,
+      lastFrameSamples: this.lastFrameSamples,
+      lastTimestampUs: this.lastTimestampUs
+    };
   }
 
   close(): void {

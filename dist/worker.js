@@ -11,12 +11,12 @@ let gHlsVariantIndex = 0;
 let pendingVariantIndex = null;
 let pendingVariantUrl = null;
 async function runHlsSession(url, startSeq) {
-    const { parseM3U8, parseMaster, timeToSeq } = await import('./playlist-35856bd8.js');
-    const { demuxTS } = await import('./demux-ts-eef4087b.js');
-    const { extractSpsPps, buildAVCCDesc } = await import('./h264-annexb-avcc-96cb3e08.js');
-    const { extractASC, getAdtsInfo } = await import('./aac-adts-raw-ca5ce116.js');
-    const { decryptAes128CbcPkcs7, seqToIv, hexToBytes } = await import('./aes-e22cff91.js');
-    const { classifyError, nextBackoff, resetBackoff } = await import('./retry-46b820d0.js');
+    const { parseM3U8, parseMaster, timeToSeq } = await import('./playlist-d855fa1e.js');
+    const { demuxTS } = await import('./demux-ts-8c9ae7ff.js');
+    const { extractSpsPps, buildAVCCDesc } = await import('./h264-annexb-avcc-eae1e80f.js');
+    const { extractASC, getAdtsInfo } = await import('./aac-adts-raw-dd9b33fc.js');
+    const { decryptAes128CbcPkcs7, seqToIv, hexToBytes } = await import('./aes-58fd1ba1.js');
+    const { classifyError, nextBackoff, resetBackoff } = await import('./retry-7902a544.js');
     let mediaUrl = url;
     // remember the master m3u8 url when a master playlist is detected
     let masterUrlStr = null;
@@ -783,7 +783,7 @@ function setupMp4Box(mp4box) {
                 let data = s.data && s.data.buffer ? s.data.buffer.slice(s.data.byteOffset || 0, (s.data.byteOffset || 0) + (s.data.byteLength || s.data.length || 0)) : (s.data && s.data.slice ? s.data.slice(0) : s.data);
                 if (isV) {
                     try {
-                        const mod = await import('./demux-mp4-a66b3286.js');
+                        const mod = await import('./demux-mp4-2b5612b7.js');
                         data = mod.avccToAnnexB(data, 4);
                     }
                     catch (e) { /* noop */ }
@@ -826,7 +826,7 @@ self.addEventListener('message', (ev) => {
         case 'fetchSegment':
             (async () => {
                 try {
-                    const { demuxTS } = await import('./demux-ts-eef4087b.js');
+                    const { demuxTS } = await import('./demux-ts-8c9ae7ff.js');
                     const r = await fetch(msg.uri);
                     const ab = await r.arrayBuffer();
                     const samples = demuxTS(ab);
@@ -911,7 +911,7 @@ self.addEventListener('message', (ev) => {
                     }
                     // fallback to built-in parser
                     try {
-                        const mod = await import('./demux-mp4-a66b3286.js');
+                        const mod = await import('./demux-mp4-2b5612b7.js');
                         const info = mod.parseInit(buf);
                         try {
                             const hasVideo = !!(info && info.video && info.video.avcC);
@@ -1036,7 +1036,7 @@ self.addEventListener('message', (ev) => {
                             postMain({ type: 'log', msg: 'openMP4 mp4box failed ' + String(e) });
                         }
                     }
-                    const mod = await import('./demux-mp4-a66b3286.js');
+                    const mod = await import('./demux-mp4-2b5612b7.js');
                     const info = mod.parseInit(buf);
                     if (info && info.audio && info.audio.esds) {
                         const parsed = parseEsdsSimple(info.audio.esds instanceof Uint8Array ? info.audio.esds : new Uint8Array(info.audio.esds));

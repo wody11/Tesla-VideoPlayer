@@ -1,14 +1,18 @@
 import type { TeslaWorkerCommand, TeslaWorkerEvent } from './worker-protocol';
-import { parseM3U8, parseMaster } from './hls/playlist';
+import { parseM3U8, parseMaster, timeToSeq } from './hls/playlist';
 import { demuxTS, TSSample } from './ts/demux-ts';
 import { extractSpsPps } from './bsf/h264-annexb-avcc';
+import { demuxMp4, type Mp4DemuxSession } from './mp4/mp4box-demuxer';
+import { decryptAes128CbcPkcs7, hexToBytes, seqToIv } from './hls/aes';
 
-// HTTP-FLV demux worker. TODO: add WS-FLV once the HTTP-FLV path is stable.
+// No-video worker for HTTP/WS FLV, HLS/TS and MP4 sample extraction.
 let aborter: AbortController | null = null;
+let socket: WebSocket | null = null;
 let paused = false;
 let videoTagCount = 0;
 let audioTagCount = 0;
 let hlsSeqCount = 0;
+let mp4Session: Mp4DemuxSession | null = null;
 
 function post(message: TeslaWorkerEvent, transfer?: Transferable[]): void {
   (self as any).postMessage(message, transfer || []);
@@ -150,6 +154,8 @@ class FlvParser {
 
 async function openHttpFlv(url: string): Promise<void> {
   aborter?.abort();
+  socket?.close();
+  socket = null;
   aborter = new AbortController();
   paused = false;
   videoTagCount = 0;
@@ -177,7 +183,130 @@ async function openHttpFlv(url: string): Promise<void> {
   }
 }
 
-async function openHls(url: string, options: { liveStartSegmentCount?: number; liveSegmentBatch?: number } = {}): Promise<void> {
+function openWsFlv(url: string): void {
+  aborter?.abort();
+  socket?.close();
+  paused = false;
+  videoTagCount = 0;
+  audioTagCount = 0;
+  const parser = new FlvParser();
+  socket = new WebSocket(url);
+  socket.binaryType = 'arraybuffer';
+  socket.onopen = () => post({ type: 'stream-open' });
+  socket.onmessage = event => {
+    if (paused) return;
+    const data = event.data instanceof ArrayBuffer
+      ? new Uint8Array(event.data)
+      : event.data instanceof Blob
+        ? null
+        : new Uint8Array(0);
+    if (data) {
+      try {
+        parser.push(data);
+      } catch (error: any) {
+        post({ type: 'error', message: String(error?.message || error) });
+      }
+    } else if (event.data instanceof Blob) {
+      event.data.arrayBuffer().then(buffer => parser.push(new Uint8Array(buffer))).catch(error => {
+        post({ type: 'error', message: String(error?.message || error) });
+      });
+    }
+  };
+  socket.onerror = () => post({ type: 'error', message: `WebSocket FLV connection failed: ${url}` });
+  socket.onclose = () => post({ type: 'stream-end' });
+}
+
+async function openMp4(url: string, startTime = 0): Promise<void> {
+  aborter?.abort();
+  mp4Session?.stop();
+  mp4Session = null;
+  aborter = new AbortController();
+  try {
+    const buffer = await fetchMp4WithRanges(url);
+    post({ type: 'stream-open' });
+    mp4Session = demuxMp4(buffer, post, startTime);
+  } catch (error: any) {
+    if (error?.name !== 'AbortError') post({ type: 'error', message: String(error?.message || error) });
+  }
+}
+
+async function fetchMp4WithRanges(url: string): Promise<ArrayBuffer> {
+  const chunkSize = 2 * 1024 * 1024;
+  const first = await fetchMp4Range(url, 0, chunkSize - 1);
+  if (!first.ok) throw new Error(`HTTP ${first.status} ${first.statusText}`);
+  const firstData = await first.arrayBuffer();
+  if (first.status === 200) return firstData;
+
+  const range = parseContentRange(first.headers.get('Content-Range'));
+  if (first.status !== 206 || !range) throw new Error('MP4 server returned an invalid partial response.');
+  const output = new Uint8Array(range.total);
+  output.set(new Uint8Array(firstData), range.start);
+  let nextOffset = range.end + 1;
+  let downloaded = firstData.byteLength;
+  post({ type: 'log', message: `MP4 Range download 0-${range.end}/${range.total}` });
+
+  const downloadWorker = async () => {
+    while (true) {
+      const offset = nextOffset;
+      if (offset >= range.total) return;
+      nextOffset += chunkSize;
+      const end = Math.min(range.total - 1, offset + chunkSize - 1);
+      const response = await fetchMp4Range(url, offset, end);
+      if (response.status !== 206) throw new Error(`MP4 Range ${offset}-${end} failed: HTTP ${response.status}.`);
+      const partRange = parseContentRange(response.headers.get('Content-Range'));
+      if (!partRange || partRange.start !== offset || partRange.total !== range.total) {
+        throw new Error(`MP4 server returned an unexpected Content-Range for offset ${offset}.`);
+      }
+      const part = new Uint8Array(await response.arrayBuffer());
+      output.set(part, offset);
+      downloaded += part.byteLength;
+      post({ type: 'log', message: `MP4 Range download ${Math.min(downloaded, range.total)}/${range.total}` });
+    }
+  };
+  await Promise.all(Array.from({ length: 4 }, () => downloadWorker()));
+  return output.buffer;
+}
+
+async function fetchMp4Range(url: string, start: number, end: number): Promise<Response> {
+  let lastError = '';
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15_000);
+    const onOuterAbort = () => controller.abort();
+    aborter?.signal.addEventListener('abort', onOuterAbort, { once: true });
+    try {
+      const response = await fetch(url, {
+        signal: controller.signal,
+        cache: 'no-store',
+        referrerPolicy: 'no-referrer',
+        headers: { Range: `bytes=${start}-${end}` }
+      });
+      if (response.ok) return response;
+      lastError = `HTTP ${response.status} ${response.statusText}`;
+    } catch (error: any) {
+      if (aborter?.signal.aborted) throw error;
+      lastError = error?.name === 'AbortError' ? 'timeout' : String(error?.message || error);
+    } finally {
+      clearTimeout(timeout);
+      aborter?.signal.removeEventListener('abort', onOuterAbort);
+    }
+    post({ type: 'log', message: `MP4 Range ${start}-${end} retry ${attempt + 1}/4: ${lastError}` });
+    await sleep(250 * (attempt + 1));
+  }
+  throw new Error(`MP4 Range ${start}-${end} failed after retries: ${lastError}`);
+}
+
+function parseContentRange(value: string | null): { start: number; end: number; total: number } | null {
+  const match = value?.match(/^bytes\s+(\d+)-(\d+)\/(\d+)$/i);
+  if (!match) return null;
+  const start = Number(match[1]);
+  const end = Number(match[2]);
+  const total = Number(match[3]);
+  return Number.isSafeInteger(start) && Number.isSafeInteger(end) && Number.isSafeInteger(total)
+    && start >= 0 && end >= start && total > end ? { start, end, total } : null;
+}
+
+async function openHls(url: string, options: { liveStartSegmentCount?: number; liveSegmentBatch?: number; startTime?: number } = {}): Promise<void> {
   aborter?.abort();
   aborter = new AbortController();
   paused = false;
@@ -188,6 +317,7 @@ async function openHls(url: string, options: { liveStartSegmentCount?: number; l
   let lastSeq = -1;
   let videoConfigured = false;
   let audioConfigSignature = '';
+  const keyCache = new Map<string, ArrayBuffer>();
 
   try {
     const firstText = await fetchText(mediaUrl);
@@ -209,8 +339,13 @@ async function openHls(url: string, options: { liveStartSegmentCount?: number; l
         ? firstText
         : await fetchText(mediaUrl);
       const playlist = parseM3U8(text, mediaUrl);
-      if (playlist.key && playlist.key.method && playlist.key.method !== 'NONE') {
-        throw new Error(`HLS encryption ${playlist.key.method} is not supported in standalone mode yet. TODO: add AES-128/SAMPLE-AES handling.`);
+      if (lastSeq < 0 && playlist.live && (options.startTime || 0) > 0) {
+        throw new Error('seek() is not available for a live HLS playlist.');
+      }
+      if (lastSeq < 0 && !playlist.live && (options.startTime || 0) > 0) {
+        const targetSeq = timeToSeq(playlist.segments, playlist.mediaSequence, (options.startTime || 0) * 1000);
+        lastSeq = targetSeq - 1;
+        post({ type: 'log', message: `HLS VOD seek starts at media sequence ${targetSeq}.` });
       }
       const candidates = playlist.segments.filter(segment => segment.seq > lastSeq);
       const liveStartSegmentCount = Math.max(1, Math.min(3, options.liveStartSegmentCount || 1));
@@ -220,7 +355,23 @@ async function openHls(url: string, options: { liveStartSegmentCount?: number; l
         if (aborter?.signal.aborted) break;
         while (paused && !aborter?.signal.aborted) await sleep(30);
         const response = await fetchWithRetry(segment.uri, 'HLS segment');
-        const samples = demuxTS(await response.arrayBuffer())
+        let segmentData = await response.arrayBuffer();
+        if (segment.key?.method === 'SAMPLE-AES') {
+          throw new Error('HLS SAMPLE-AES is not supported without sample-level decryption/EME.');
+        }
+        if (segment.key?.method === 'AES-128') {
+          if (!segment.key.uri) throw new Error('HLS AES-128 key URI is missing.');
+          let keyData = keyCache.get(segment.key.uri);
+          if (!keyData) {
+            keyData = await (await fetchWithRetry(segment.key.uri, 'HLS AES-128 key')).arrayBuffer();
+            if (keyData.byteLength !== 16) throw new Error(`Invalid HLS AES-128 key length: ${keyData.byteLength}.`);
+            keyCache.set(segment.key.uri, keyData);
+          }
+          const iv = segment.key.ivHex ? hexToBytes(segment.key.ivHex) : seqToIv(segment.seq);
+          if (iv.byteLength !== 16) throw new Error(`Invalid HLS AES-128 IV length: ${iv.byteLength}.`);
+          segmentData = await decryptAes128CbcPkcs7(segmentData, keyData, iv);
+        }
+        const samples = demuxTS(segmentData)
           .filter(sample => Number.isFinite(sample.tsUs) && sample.tsUs > 0);
         lastSeq = segment.seq;
         hlsSeqCount += 1;
@@ -275,7 +426,7 @@ async function openHls(url: string, options: { liveStartSegmentCount?: number; l
         }
       }
 
-      if (playlist.endList) break;
+      if (playlist.endList && !playlist.segments.some(segment => segment.seq > lastSeq)) break;
       const waitMs = Math.max(300, Math.min(2000, Math.round((playlist.targetDuration || 4) * 500)));
       await sleep(waitMs);
     }
@@ -335,8 +486,17 @@ function sleep(ms: number): Promise<void> {
 self.addEventListener('message', (event: MessageEvent<TeslaWorkerCommand>) => {
   const message = event.data;
   if (message.type === 'open-http-flv') openHttpFlv(message.url);
+  else if (message.type === 'open-ws-flv') openWsFlv(message.url);
   else if (message.type === 'open-hls') openHls(message.url, message);
+  else if (message.type === 'open-mp4') openMp4(message.url, message.startTime);
+  else if (message.type === 'pull') mp4Session?.pull(message.count);
   else if (message.type === 'pause') paused = true;
   else if (message.type === 'resume') paused = false;
-  else if (message.type === 'stop') aborter?.abort();
+  else if (message.type === 'stop') {
+    aborter?.abort();
+    socket?.close();
+    socket = null;
+    mp4Session?.stop();
+    mp4Session = null;
+  }
 });

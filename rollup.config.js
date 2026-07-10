@@ -6,6 +6,7 @@ export default {
   input: {
     index: 'src/index.ts',
     worker: 'src/worker/index.ts',
+    'worker-entry': 'src/worker/worker-entry.ts',
     'http-flv-worker': 'src/worker/http-flv-worker.ts'
   },
   output: {

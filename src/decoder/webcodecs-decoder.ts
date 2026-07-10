@@ -3,6 +3,7 @@ export interface WebCodecsDecoderSink {
   onVideoFrame(frame: any): void;
   onAudioFrame(frame: any): void;
   onError(error: Error): void;
+  onLog?(message: string): void;
 }
 
 export class WebCodecsDecoder {
@@ -55,24 +56,40 @@ export class WebCodecsDecoder {
 
   decodeVideo(sample: { data: ArrayBuffer; timestamp: number; duration?: number; key: boolean }): void {
     if (!this.videoDecoder || this.videoDecoder.state === 'closed') return;
-    const chunk = new (window as any).EncodedVideoChunk({
-      type: sample.key ? 'key' : 'delta',
-      timestamp: sample.timestamp,
-      duration: sample.duration,
-      data: sample.data
-    });
-    this.videoDecoder.decode(chunk);
+    try {
+      const chunk = new (window as any).EncodedVideoChunk({
+        type: sample.key ? 'key' : 'delta',
+        timestamp: sample.timestamp,
+        duration: sample.duration,
+        data: sample.data
+      });
+      this.videoDecoder.decode(chunk);
+    } catch (error: any) {
+      this.sink.onError(error instanceof Error ? error : new Error(String(error)));
+    }
   }
 
   decodeAudio(sample: { data: ArrayBuffer; timestamp: number; duration?: number }): void {
     if (!this.audioDecoder || this.audioDecoder.state === 'closed') return;
-    const chunk = new (window as any).EncodedAudioChunk({
-      type: 'key',
-      timestamp: sample.timestamp,
-      duration: sample.duration,
-      data: sample.data
-    });
-    this.audioDecoder.decode(chunk);
+    try {
+      const chunk = new (window as any).EncodedAudioChunk({
+        type: 'key',
+        timestamp: sample.timestamp,
+        duration: sample.duration,
+        data: sample.data
+      });
+      this.audioDecoder.decode(chunk);
+    } catch (error: any) {
+      this.sink.onError(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  videoDecodeQueueSize(): number {
+    return this.videoDecoder?.decodeQueueSize || 0;
+  }
+
+  audioDecodeQueueSize(): number {
+    return this.audioDecoder?.decodeQueueSize || 0;
   }
 
   close(): void {

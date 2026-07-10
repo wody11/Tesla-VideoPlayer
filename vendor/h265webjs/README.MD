@@ -1,0 +1,663 @@
+# h265web.js
+
+| 更新 | 内容 |
+| ---- | ---- |
+| 时间 | 2021/02/18 |
+| 内容1 | 1.新播放内核，增加音频播放能力 |
+| 时间 | 2021/02/08 |
+| 内容1 | 1.增加播放内核类型：新播放内核，可兼容多种解码Badcase(测试阶段, 输入媒资Mp4Box需要前置Moov，当前还不支持音频、Seek) |
+| 时间 | 2021/01/04 |
+| 内容1 | 1.支持H.265的流式接入，可直接以265的URI进行播放、也可以流式字节填充播放（可应用于直播） |
+| 内容2 | 2.取消了播放器自带的播放view蒙板（用于点击播放画面触发暂停/播放能力），开放给用户自行实现 |
+| 内容3 | 3.支持 如果播放器配置的长宽与视频纵横比不匹配，自动裁剪黑边区域 |
+| 内容4 | 4.增加`onPlayFinish` 事件回调，播放结束调用 |
+
+| @TODO | 内容 |
+| ---- | ---- |
+| 播放问题 | 新内核增加Seek能力 |
+
+| h265web.js | mpeg.js `(解析ts)` |
+| ---- | ---- |
+| [![npm version](https://badge.fury.io/js/h265web.js.svg)](https://www.npmjs.com/package/h265web.js) | [![npm version](https://badge.fury.io/js/mpeg.js.svg)](https://www.npmjs.com/package/mpeg.js) |
+
+<a href="https://www.gnu.org/licenses/gpl-3.0.md">License GPL-3.0 https://www.gnu.org/licenses/gpl-3.0.md</a>
+
+README.md：<a href="README.MD">中文</a> | <a href="README_EN.MD">English</a>
+
+<img src="./resource/logo@300x300.png" width="300px" />
+
+————————— __`一个可支持HEVC/H.265编码播放720P、1080P的播放器。`__
+
+__`~^_^~ 作者用爱发电` 如果 <a href="https://github.com/numberwolf/h265web.js">h265web.js</a> 帮助到了你，请点击右上角的star~__
+
+## 目录
+
+- [0、说明](#0说明)
+
+	- [当前能力](#当前能力)
+
+	- [当前版本token](#当前版本的token)
+
+	- [联系我](#联系我)
+
+	- [线上demo](#线上demo)
+
+	- [效果预览](#效果预览)
+
+- [1、快捷方式使用](#1快捷方式使用)
+
+- [2、播放器SDK使用文档](#2播放器sdk使用文档)
+
+	- [安装](#安装)
+
+	- [播放器配置](#播放器配置)
+
+	- [初始化播放器](#初始化播放器)
+
+	- [播放器相关事件绑定](#播放器相关事件绑定)
+
+	- [播放器API能力](#播放器api能力)
+
+- [3、其它帮助](#3其它帮助)
+	
+	- [FFmpeg转码265编码的视频](#ffmpeg转码265编码的视频)
+
+<hr>
+
+### 0、说明 ###
+
+#### 当前能力 ####
+
+* 协议
+
+|  协议 | 模式 | 是否支持 | 说明 |
+| ---- | ---- |  ----  | ---- |
+| mp4 | 点播 |  是  | ---- |
+| mpeg-ts | 点播 |  是  | ---- |
+| m3u8 | 点播 |  是  | ---- |
+| hls | 直播 |  是  | ---- |
+| H.265 | 点播 |  是  | ---- |
+| H.265 | 直播 |  是  | ---- |
+| http-flv | 直播 |  否  | 待支持 |
+| flv | 点播 |  否  | 待支持 |
+
+* 能力
+
+|  能力 | 是否支持 | 其他 |
+| ---- | ---- |  ----  |
+| 直播 | 是 |  ----  | ---- |
+| 点播 | 是 |  ----  | ---- |
+| Seek跳转 | 是 | core=1 时的新内核不支持 | ---- |
+| 精准Seek | 是 |  ----  | ---- |
+| 封面图 | 是 |  ----  | ---- |
+| 边下边播 | 是 |  ----  | ---- |
+| 音量调节 | 是 |  ----  | ---- |
+| 播放 | 是 |  ----  | ---- |
+| 暂停 | 是 |  ----  | ---- |
+| 重新播放 | 是 |  ----  | ---- |
+| 暂停截图 | 是 |  ----  | ---- |
+| 1080p播放 | 是 |  ----  | ---- |
+| 720p播放 | 是 |  ----  | ---- |
+| 多路播放 | 是 |  ----  | ---- |
+
+<br>
+
+#### 当前版本的token ####
+
+```javascript
+token = "base64:QXV0aG9yOmNoYW5neWFubG9uZ3xudW1iZXJ3b2xmLEdpdGh1YjpodHRwczovL2dpdGh1Yi5jb20vbnVtYmVyd29sZixFbWFpbDpwb3JzY2hlZ3QyM0Bmb3htYWlsLmNvbSxRUTo1MzEzNjU4NzIsSG9tZVBhZ2U6aHR0cDovL3h2aWRlby52aWRlbyxEaXNjb3JkOm51bWJlcndvbGYjODY5NCx3ZWNoYXI6bnVtYmVyd29sZjExLEJlaWppbmcsV29ya0luOkJhaWR1";
+```
+
+<br>
+
+#### 联系我 ####
+
+* Github: https://github.com/numberwolf/h265web.js
+* Email(porschegt23@foxmail.com)
+* QQ: 531365872
+* Discord:numberwolf#8694
+* 微信:numberwolf11
+
+<br>
+
+#### 线上demo ####
+
+<a href="http://hevc.xvideo.video/">http://hevc.xvideo.video</a>
+
+<br>
+
+#### 效果预览 ####
+
+|  类型 |  点播 | 直播 |
+| ---- |  ----  | ---- |
+|  点击<br>放大 | <a href='./resource/demo3.png' target="_blank"><img src="./resource/demo3.png" height="300px" /></a>  | <a href='./resource/demo2.png' target="_blank"><img src="./resource/demo2.png" height="300px" /></a> |
+
+<br>
+
+## 1、快捷方式使用 ##
+
+* 使用流程也可以直接看 `play.js`和`index.html`的Demo使用
+
+* 本项目可以直接放在你的`web服务器`目录下访问`index.html`
+
+<br>
+
+## 2、播放器SDK使用文档 ##
+
+———————— __API以及事件能力__
+
+### 安装 ###
+
+#### 1）引入包
+
+* 方式1.1：引入Github的本地文件 `require`形式 
+
+```javascript
+// 引入Github的本地文件
+require('./dist/h265webjs');
+```
+
+* 方式1.2：引入Github的本地文件 `import xxx from xxx`形式 （推荐）
+
+```javascript
+// 引入Github的本地文件
+import H265webjsModule from './dist/index';
+```
+
+* 方式2：从npm商店引入
+
+[![npm version](https://badge.fury.io/js/h265web.js.svg)](https://www.npmjs.com/package/h265web.js) | <a href="https://www.npmjs.com/package/h265web.js">npm:h265web.js</a>
+
+<br>
+
+#### 2）安装Wasm
+
+* 如果使用了直接从Github下载dist的话这一步可以跳过。
+
+* 如果用`npm`方式进行安装，则需要将`./node_modules/h265web.js/dist/*.wasm`拷贝到你的`h265webjs.js`同级目录下才可以。
+
+	* 示例Cmd
+
+	```bash
+	npm i h265web.js
+	cp ./node_modules/h265web.js/dist/*.wasm ./dist/
+	```
+
+<br>
+
+#### 3）引入h265web.js到你的项目
+
+* 本地引入（从Github <a href="https://github.com/numberwolf/h265web.js">h265web.js</a>）
+
+	* 1）require形式
+	```javascript
+	require('./dist/h265webjs');
+	```
+
+	* 2）`import xxx from xxx`形式 （推荐）
+	```javascript
+	// 引入Github的本地文件
+	import H265webjsModule from './dist/index';
+	```
+
+* npm形式引入
+
+[![npm version](https://badge.fury.io/js/h265web.js.svg)](https://www.npmjs.com/package/h265web.js)
+
+```javascript
+const H265webjs = require('h265web.js');
+```
+
+<br>
+
+### 播放器配置 ###
+
+* 创建代码如下
+
+```javascript
+const PLAYER_CORE_TYPE_DEFAULT = 0; // 默认播放器内核
+const PLAYER_CORE_TYPE_CNATIVE = 1; // 实验播放器内核
+
+var config = {
+    type: "mp4",
+    player: "glplayer",
+    width: 960,
+    height: 540,
+    accurateSeek : true,
+    token : token,
+    extInfo : {
+        moovStartFlag : true,
+        readyShow : true,
+        rawFps : 30,
+        autoCrop : false,
+        core : PLAYER_CORE_TYPE_DEFAULT
+    }
+};
+```
+
+* 配置详解
+
+|  配置项 | 类型 | 可选值 | 必填 | 说明 | 
+|  ----  | ----  | ---- | ---- | ---- |
+| type  | String | mp4/hls/ts/raw265 | 是 | 播放文件的类型 |
+| player  | String | - | 是 | 播放窗口的dom的id值 |
+| width  | Int | - | 是 | 播放窗口的宽度 |
+| height  | Int | - | 是 | 播放窗口的高度 |
+| accurateSeek  | Bool | true/false | 是 | 精准Seek（暂时固定为true） |
+| token  | String | - | 是 | 播放器token值 |
+| extInfo  | Object | - | 否 | 播放器额外配置 |
+| \+ moovStartFlag  | Bool | true/false | 否:默认false | Mp4的moov box是否前置 关联到动态加载 |
+| \+ readyShow  | Bool | true/false | 否:默认false | 是否需要封面图展示 |
+| \+ rawFps  | Float32 | 例如:30 | 否:默认24 | HEVC/AVC裸流播放时候的帧率设定 |
+| \+ autoCrop  | Bool | - | 否:默认false | 如果播放器配置的长宽与视频纵横比不匹配，自动裁剪黑边区域 |
+| \+ core  | Int | - | 否:默认0 | 0:默认播放内核 1:测试阶段的高成功率播放内核 |
+
+
+<br>
+
+### 初始化播放器 ###
+
+* 创建方法(全局方法) 
+
+> new265webjs(`播放地址`, `播放器配置`)
+
+|  参数 | 类型 | 默认值 | 必填 | 说明 | 
+|  ----  | ----  | ---- | ---- | ---- |
+| 播放地址  | String | - | 是 | 播放视频地址 |
+| 播放器配置  | Object | - | 是 | 播放器配置信息 |
+
+* 创建示例Demo
+
+	* 1）路径 + 配置
+		* 例子1 创建 `mp4/hls/ts`类型播放器
+
+		```javascript
+		let videoURL = "h265_test.mp4";
+		let config = {
+		    type: "mp4",
+		    player: "glplayer",
+		    width: 960,
+		    height: 540,
+		    accurateSeek : true,
+		    token : token,
+		    extInfo : {
+		        moovStartFlag : true,
+		        readyShow : true
+		    }
+		};
+		````
+
+		* 例子2 创建`raw265`类型 播放h265裸流 播放器（包括直播）
+
+		```javascript
+		let config = {
+		    type: "raw265",
+		    player: "glplayer",
+		    width: 960,
+		    height: 540,
+		    accurateSeek : true,
+		    token : token,
+		    extInfo : {
+		        readyShow : true,
+		        rawFps : 30 // 播放帧率
+		    }
+		};
+		````
+
+	* 2）创建播放器
+		* 1. 以`require('./src/h265webjs');`引入为前提
+
+		示例：
+		```javascript
+		let h265webjs = new265webjs(videoURL, config); // 全局方法
+		```
+
+		* 2. 以`import H265webjsModule from './dist/index';`引入为前提 （推荐）
+
+		示例：
+		```javascript
+		let h265webjs = H265webjsModule.createPlayer(videoURL, config);
+		```
+
+		* 3. 如果创建的是`raw265`类型的裸流数据播放 请注意
+
+			* `raw265`类型下，喂字节流播放
+
+			调用函数
+
+			|  函数 | 返回 | 说明 | 
+			|  ----  | ----  | ---- |
+			| append265raw  | bool | 喂裸流字节数据 |
+
+			参数
+
+			| 参数 | 类型 | 默认值 | 必填 | 说明 | 
+			|  ----  | ----  | ---- | ---- | ---- |
+			| chunk  | Uint8Array | - | 是 | 字节裸流数据 |
+
+			例子 - 这里直接将265文件通过网络串流传输
+
+			```javascript
+			let videoURL = "demo/res/raw.h265";
+		    // fetch 265
+		    let fileStart = 0;
+		    let startFetch = false;
+		    let networkInterval = window.setInterval(() => {
+		        if (!startFetch) {
+		            startFetch = true;
+		            fetch(videoURL).then(function(response) {
+		                let pump = function(reader) {
+		                    return reader.read().then(function(result) {
+		                        if (result.done) {
+		                            window.clearInterval(networkInterval);
+		                            return;
+		                        }
+		                        let chunk = result.value;
+		                        // console.log(chunk);
+		                        h265webjs.append265raw(chunk); // 调用喂流
+		                        return pump(reader);
+		                    });
+		                }
+		                return pump(response.body.getReader());
+		            })
+		            .catch(function(error) {
+		                console.log(error);
+		            });
+		        }
+		    }, 1);
+			```
+
+<br>
+
+### 播放器相关事件绑定 ###
+
+#### 1）Seek完成
+
+> 主要用于SEEK完成做一些操作
+
+* 示例
+
+```javascript
+player.onSeekFinish = () => {
+    // todo
+};
+```
+
+<br>
+
+#### 2）YUV帧数据渲染
+
+|  回调参数 | 类型 | 默认值 | 必填 | 说明 | 
+|  ----  | ----  | ---- | ---- | ---- |
+| width  | int | - | - | YUV宽度 |
+| height  | int | - | - | YUV高度 |
+| imageBufferY  | Uint8Array | - | - | Y分量 |
+| imageBufferB  | Uint8Array | - | - | ChromaB分量 |
+| imageBufferR  | Uint8Array | - | - | ChromaR分量 |
+
+> 可以利用事件回调的YUV做全屏播放
+
+> 需要调用 `setRenderScreen` 函数开启才可以收到事件回调数据, 下方`1.5 API`会说明
+
+* 示例
+
+```javascript
+player.onRender = (width, height, imageBufferY, imageBufferB, imageBufferR) => {
+	// todo
+};
+```
+
+<br>
+
+#### 3）媒体文件加载完成事件
+
+> 媒体文件当前加载成功，可以进行播放
+
+* 示例
+
+```javascript
+player.onLoadFinish = () => {
+	// todo
+};
+```
+
+<br>
+
+#### 4）播放器当前播放PTS（时刻）更新
+
+|  回调参数 | 类型 | 默认值 | 必填 | 说明 | 
+|  ----  | ----  | ---- | ---- | ---- |
+| videoPTS  | float64 | - | - | 当前播放时间 |
+
+* 示例
+
+```javascript
+player.onPlayTime = (videoPTS) => {
+	// todo
+	console.log(videoPTS)
+};
+```
+
+#### 5）播放器媒体播放结束事件
+
+* 示例
+
+```javascript
+player.onPlayFinish = () => {
+    // finished
+};
+```
+
+<br>
+
+### 播放器API能力 ###
+
+#### 1）加载播放器
+
+> 一般在配置完成【播放器配置】和【事件】之后进行播放器加载
+
+* 示例
+
+```javascript
+player.do();
+```
+
+<br>
+
+#### 2）获取当前播放状态
+
+|  调用函数 | 返回 | 说明 |
+|  ---- | ----  | ---- |
+| isPlaying() | bool | 是否正在播放中 |
+
+* 示例
+
+```javascript
+if (player.isPlaying()) {
+	// 正在播放中
+} else {
+	// 当前是暂停状态
+}
+```
+
+<br>
+
+#### 3）开始播放
+
+|  调用函数 | 返回 | 说明 |
+|  ----  | ----  | ---- |
+| play()  | - | 开始播放 |
+
+* 示例
+
+```javascript
+player.play();
+```
+
+<br>
+
+#### 4）暂停播放
+
+|  调用函数 | 返回 | 说明 |
+|  ----  | ----  | ---- |
+| pause()  | - | 暂停播放 |
+
+* 示例
+
+```javascript
+player.pause();
+```
+
+<br>
+
+#### 5）开启/关闭渲染过程中 回调YUV帧数据
+
+> 开启之后，`onRender`事件才可以收到数据
+
+|  调用函数 | 返回 | 说明 |
+|  ----  | ----  | ---- |
+| setRenderScreen(`{param1}`)  | - | 开启/关闭渲染过程中 回调YUV帧数据 |
+
+* 参数
+
+|  参数 | 类型 | 默认值 | 说明 |
+|  ----  | ---- | ----  | ---- |
+| param1 | bool | false | 开启/关闭渲染过程中 回调YUV帧数据 |
+
+* 示例
+
+```javascript
+// 开启
+player.setRenderScreen(true);
+// 关闭
+player.setRenderScreen(false);
+```
+
+<br>
+
+#### 6）Seek: 跳转到某个时刻
+
+|  调用函数 | 返回 | 说明 |
+|  ----  | ----  | ---- |
+| seek(`{pts}`)  | - | Seek到某一个时刻 |
+
+* 参数
+
+|  参数 | 类型 | 默认值 | 说明 |
+|  ----  | ---- | ----  | ---- |
+| pts | float64 | - | Seek到某一个时刻的时间点 |
+
+* 示例
+
+```javascript
+// Seek到10.01秒
+player.seek(10.01);
+```
+
+<br>
+
+#### 7）调整音量
+
+> 调整视频的播放音量
+
+|  调用函数 | 返回 | 说明 |
+|  ----  | ----  | ---- |
+| setVoice(`{volume}`)  | - | 调整音量 |
+
+* 参数
+
+|  参数 | 类型 | 默认值 | 说明 |
+|  ----  | ---- | ----  | ---- |
+| volume | float64 | - | 范围区间是`[0, 1.0]`, 0为mute，1.0为全开音量 |
+
+* 示例
+
+```javascript
+// 音量开启一半
+player.setVoice(0.5);
+```
+
+<br>
+
+#### 8）获取媒资数据
+
+> 获取当前播放的视频文件的信息数据
+
+|  调用函数 | 返回 | 说明 |
+|  ----  | ----  | ---- |
+| mediaInfo()  | Object | 媒资详情 |
+
+* 返回值示例
+
+```json
+meta:
+	audioNone: false // 是否不包含音频轨
+	durationMs: 600000 // 时长 毫秒级
+	fps: 25 // 帧率
+	sampleRate: 44100 // 音频采样率
+	size: // 视频分辨率
+		height: 720
+		width: 1280
+	videoCodec: 0
+videoType: "vod" // 点播vod 直播live
+```
+
+* 示例
+
+```javascript
+let mediaInfo = player.mediaInfo();
+```
+
+<br>
+
+## 3、其它帮助 ##
+
+### FFmpeg转码265编码的视频 ###
+
+* mp4
+
+```bash
+ffmpeg -i input.mp4 \
+-vcodec libx265 -pix_fmt \
+-acodec aac -ac 2 -ar 44100 \
+-preset medium -maxrate 1000k -bufsize 1000k \
+-vtag hev1 \
+-movflags faststart \
+-y video.mp4
+```
+
+* hls/m3u8 录屏
+
+```bash
+ffmpeg -f avfoundation -i 1:0 \
+-q 4 -r 10 \
+-filter_complex "scale=1280:720" \
+-pix_fmt yuv420p \
+-vcodec libx265 \
+-ar 22050 -ab 64k -ac 1 -acodec aac \
+-threads 4 \
+-preset veryfast \
+-f segment \
+-segment_list test.m3u8 \
+-segment_time 5 \
+-y /Users/numberwolf/Documents/webroot/VideoMissile/VideoMissilePlayer/res/hls1/v-%03d.ts
+```
+
+* mpeg-ts
+
+```bash
+ffmpeg -ss 20 -t 10 -i ./res/xinxiaomen.mp4 \
+-vcodec libx265 -x265-params "bframes=0:keyint=10" -r 24 -filter_complex "scale=720:1280" -preset fast -maxrate 800k -bufsize 800k \
+-acodec aac -ar 22050 -ac 1 \
+-pix_fmt yuv420p \
+-f mpegts -y ./res/veilside2.ts
+```
+
+
+
+
+
+
+
+
+

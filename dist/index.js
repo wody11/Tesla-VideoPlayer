@@ -1,3 +1,169 @@
+export { decodePesTimestamp, demuxTS } from './demux-ts-8c9ae7ff.js';
+import './aac-adts-raw-dd9b33fc.js';
+
+/*
+ * Tesla-VideoPlayer is based on Jessibuca open source architecture.
+ * Jessibuca is licensed under GPL-3.0. See THIRD_PARTY_NOTICES.md.
+ */
+class PlayerEvents {
+    constructor() {
+        this.listeners = {};
+    }
+    on(event, listener) {
+        const list = this.listeners[event] || [];
+        list.push(listener);
+        this.listeners[event] = list;
+        return () => this.off(event, listener);
+    }
+    off(event, listener) {
+        const list = this.listeners[event];
+        if (!list)
+            return;
+        const index = list.indexOf(listener);
+        if (index >= 0)
+            list.splice(index, 1);
+    }
+    emit(event, payload) {
+        for (const listener of this.listeners[event] || []) {
+            try {
+                listener(payload);
+            }
+            catch {
+                // External handlers must not break playback internals.
+            }
+        }
+    }
+    clear() {
+        this.listeners = {};
+    }
+}
+
+/*
+ * Tesla-VideoPlayer is based on Jessibuca open source architecture.
+ * Jessibuca is licensed under GPL-3.0. See THIRD_PARTY_NOTICES.md.
+ */
+class PlayerStateMachine {
+    constructor() {
+        this.state = 'idle';
+    }
+    get current() {
+        return this.state;
+    }
+    transition(next) {
+        if (this.state === 'destroyed')
+            return this.state;
+        this.state = next;
+        return this.state;
+    }
+    canAcceptMedia() {
+        return this.state === 'loading' || this.state === 'playing' || this.state === 'seeking';
+    }
+}
+
+/*
+ * Tesla-VideoPlayer is based on Jessibuca open source architecture.
+ * Jessibuca is licensed under GPL-3.0. See THIRD_PARTY_NOTICES.md.
+ */
+class PlayerStatsTracker {
+    constructor() {
+        this.stats = {
+            sourceType: 'unknown',
+            decoderType: 'none',
+            rendererType: 'none',
+            audioType: 'none',
+            videoTagCount: 0,
+            audioSampleCount: 0,
+            canvasCount: 0,
+            fps: 0,
+            decodedFrames: 0,
+            droppedFrames: 0,
+            audioQueueMs: 0,
+            audioDecodedFrames: 0,
+            audioScheduledSources: 0,
+            audioFrameSamples: 0,
+            audioContextState: 'closed',
+            videoQueueLength: 0,
+            currentTime: 0,
+            currentTimeMs: 0,
+            duration: 0,
+            firstFrameTimeMs: 0,
+            bitrate: 0,
+            reconnectCount: 0,
+            lastError: ''
+        };
+        this.frameTicks = 0;
+        this.lastFpsAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    }
+    patch(values) {
+        this.stats = { ...this.stats, ...values };
+    }
+    markDecoded() {
+        this.stats.decodedFrames += 1;
+    }
+    markDropped() {
+        this.stats.droppedFrames += 1;
+    }
+    markRendered() {
+        this.frameTicks += 1;
+        const now = performance.now();
+        if (now - this.lastFpsAt >= 1000) {
+            this.stats.fps = this.frameTicks;
+            this.frameTicks = 0;
+            this.lastFpsAt = now;
+        }
+    }
+    snapshot() {
+        if (typeof document !== 'undefined') {
+            this.patch({
+                videoTagCount: document.querySelectorAll('video').length,
+                canvasCount: document.querySelectorAll('canvas').length
+            });
+        }
+        return { ...this.stats };
+    }
+}
+
+/*
+ * Tesla-VideoPlayer is based on Jessibuca open source architecture.
+ * Jessibuca is licensed under GPL-3.0. See THIRD_PARTY_NOTICES.md.
+ */
+function inferSourceType(url) {
+    if (/^wss?:\/\//i.test(url) && /\.flv(\?|$)/i.test(url))
+        return 'ws-flv';
+    if (/\.m3u8(\?|$)/i.test(url))
+        return 'hls';
+    if (/\.mp4(\?|$)/i.test(url) || /[?&]mime_type=video_mp4(?:&|$)/i.test(url))
+        return 'mp4';
+    if (/\.flv(\?|$)/i.test(url) || /^https?:\/\//i.test(url))
+        return 'http-flv';
+    return 'unknown';
+}
+
+/*
+ * Tesla-VideoPlayer is based on Jessibuca open source architecture.
+ * Jessibuca is licensed under GPL-3.0. See THIRD_PARTY_NOTICES.md.
+ */
+function assertNoVideoElements() {
+    return document.querySelectorAll('video').length;
+}
+class NoVideoGuard {
+    start(onViolation) {
+        this.stop();
+        const check = () => {
+            const count = assertNoVideoElements();
+            if (count > 0)
+                onViolation(count);
+        };
+        check();
+        this.observer = new MutationObserver(check);
+        this.observer.observe(document.documentElement, { childList: true, subtree: true });
+    }
+    stop() {
+        this.observer?.disconnect();
+        this.observer = undefined;
+    }
+}
+
 // Maps media timestamps to AudioContext time so video can follow audio.
 class AudioClock {
     reset() {
@@ -30,6 +196,9 @@ class WebAudioPlayer {
         this.sources = new Set();
         this.targetQueueMs = 1500;
         this.hardResetQueueMs = 7000;
+        this.enqueuedFrames = 0;
+        this.lastFrameSamples = 0;
+        this.lastTimestampUs = 0;
         const Ctor = window.AudioContext || window.webkitAudioContext;
         if (!Ctor)
             throw new Error('WebAudio is not available.');
@@ -51,7 +220,7 @@ class WebAudioPlayer {
     }
     setMaxQueueMs(value) {
         this.targetQueueMs = Math.max(300, Math.min(5000, Number(value) || 1500));
-        this.hardResetQueueMs = Math.max(this.targetQueueMs * 3, this.targetQueueMs + 3000);
+        this.hardResetQueueMs = Math.max(this.targetQueueMs * 2, this.targetQueueMs + 1000);
     }
     enqueue(frame) {
         if (this.context.state !== 'running')
@@ -60,6 +229,9 @@ class WebAudioPlayer {
         const frames = frame.numberOfFrames || 0;
         const sampleRate = frame.sampleRate || this.context.sampleRate;
         const timestamp = typeof frame.timestamp === 'number' ? frame.timestamp : 0;
+        this.enqueuedFrames += 1;
+        this.lastFrameSamples = frames;
+        this.lastTimestampUs = timestamp;
         if (this.queuedMs() > this.hardResetQueueMs) {
             this.stopScheduledSources();
             this.clock.reset();
@@ -81,7 +253,7 @@ class WebAudioPlayer {
         source.buffer = audioBuffer;
         const queueMs = this.queuedMs();
         const catchupRate = queueMs > this.targetQueueMs
-            ? Math.min(1.08, 1 + ((queueMs - this.targetQueueMs) / Math.max(this.targetQueueMs, 1)) * 0.04)
+            ? Math.min(1.12, 1 + ((queueMs - this.targetQueueMs) / Math.max(this.targetQueueMs, 1)) * 0.06)
             : 1;
         source.playbackRate.setValueAtTime(catchupRate, this.context.currentTime);
         source.connect(this.gain);
@@ -107,6 +279,15 @@ class WebAudioPlayer {
         if (target === undefined)
             return undefined;
         return (target - this.context.currentTime) * 1000;
+    }
+    diagnostics() {
+        return {
+            contextState: this.context.state,
+            enqueuedFrames: this.enqueuedFrames,
+            scheduledSources: this.sources.size,
+            lastFrameSamples: this.lastFrameSamples,
+            lastTimestampUs: this.lastTimestampUs
+        };
     }
     close() {
         this.stopScheduledSources();
@@ -178,24 +359,40 @@ class WebCodecsDecoder {
     decodeVideo(sample) {
         if (!this.videoDecoder || this.videoDecoder.state === 'closed')
             return;
-        const chunk = new window.EncodedVideoChunk({
-            type: sample.key ? 'key' : 'delta',
-            timestamp: sample.timestamp,
-            duration: sample.duration,
-            data: sample.data
-        });
-        this.videoDecoder.decode(chunk);
+        try {
+            const chunk = new window.EncodedVideoChunk({
+                type: sample.key ? 'key' : 'delta',
+                timestamp: sample.timestamp,
+                duration: sample.duration,
+                data: sample.data
+            });
+            this.videoDecoder.decode(chunk);
+        }
+        catch (error) {
+            this.sink.onError(error instanceof Error ? error : new Error(String(error)));
+        }
     }
     decodeAudio(sample) {
         if (!this.audioDecoder || this.audioDecoder.state === 'closed')
             return;
-        const chunk = new window.EncodedAudioChunk({
-            type: 'key',
-            timestamp: sample.timestamp,
-            duration: sample.duration,
-            data: sample.data
-        });
-        this.audioDecoder.decode(chunk);
+        try {
+            const chunk = new window.EncodedAudioChunk({
+                type: 'key',
+                timestamp: sample.timestamp,
+                duration: sample.duration,
+                data: sample.data
+            });
+            this.audioDecoder.decode(chunk);
+        }
+        catch (error) {
+            this.sink.onError(error instanceof Error ? error : new Error(String(error)));
+        }
+    }
+    videoDecodeQueueSize() {
+        return this.videoDecoder?.decodeQueueSize || 0;
+    }
+    audioDecodeQueueSize() {
+        return this.audioDecoder?.decodeQueueSize || 0;
     }
     close() {
         this.closeVideo();
@@ -353,10 +550,15 @@ class WebGLRenderer {
     }
 }
 
-function detectCapability(canvas) {
+/*
+ * Tesla-VideoPlayer is based on Jessibuca open source architecture.
+ * Jessibuca is licensed under GPL-3.0. See THIRD_PARTY_NOTICES.md.
+ */
+function detectCapability(canvas, requireWebCodecs = true) {
     const webCodecsVideo = typeof globalThis.VideoDecoder === 'function';
     const webCodecsAudio = typeof globalThis.AudioDecoder === 'function';
     const webAudio = typeof globalThis.AudioContext === 'function' || typeof globalThis.webkitAudioContext === 'function';
+    const wasm = typeof WebAssembly !== 'undefined';
     let webGL = false;
     try {
         const probe = canvas || document.createElement('canvas');
@@ -365,128 +567,9 @@ function detectCapability(canvas) {
     catch {
         webGL = false;
     }
-    const supported = webCodecsVideo && webCodecsAudio && webAudio;
-    const reason = supported ? undefined : 'This browser must support WebCodecs VideoDecoder, WebCodecs AudioDecoder, and WebAudio.';
-    return { webCodecsVideo, webCodecsAudio, webAudio, webGL, supported, reason };
-}
-
-// Guardrail for the project rule that playback must never create video tags.
-function assertNoVideoElements() {
-    return document.querySelectorAll('video').length;
-}
-class NoVideoGuard {
-    start(onViolation) {
-        this.stop();
-        const check = () => {
-            const count = assertNoVideoElements();
-            if (count > 0)
-                onViolation(count);
-        };
-        check();
-        this.observer = new MutationObserver(check);
-        this.observer.observe(document.documentElement, { childList: true, subtree: true });
-    }
-    stop() {
-        if (this.observer)
-            this.observer.disconnect();
-        this.observer = undefined;
-    }
-}
-
-class PlayerEvents {
-    constructor() {
-        this.listeners = {};
-    }
-    on(event, listener) {
-        const list = this.listeners[event] || [];
-        list.push(listener);
-        this.listeners[event] = list;
-        return () => this.off(event, listener);
-    }
-    off(event, listener) {
-        const list = this.listeners[event];
-        if (!list)
-            return;
-        const index = list.indexOf(listener);
-        if (index >= 0)
-            list.splice(index, 1);
-    }
-    emit(event, payload) {
-        for (const listener of this.listeners[event] || []) {
-            try {
-                listener(payload);
-            }
-            catch {
-                // User listeners must not break playback internals.
-            }
-        }
-    }
-    clear() {
-        this.listeners = {};
-    }
-}
-
-class PlayerStateMachine {
-    constructor() {
-        this.state = 'idle';
-    }
-    get current() {
-        return this.state;
-    }
-    transition(next) {
-        if (this.state === 'destroyed')
-            return this.state;
-        this.state = next;
-        return this.state;
-    }
-    canAcceptMedia() {
-        return this.state === 'loading' || this.state === 'playing';
-    }
-}
-
-class PlayerStatsTracker {
-    constructor() {
-        this.stats = {
-            decoderType: 'none',
-            rendererType: 'none',
-            videoTagCount: 0,
-            canvasCount: 0,
-            fps: 0,
-            decodedFrames: 0,
-            droppedFrames: 0,
-            audioQueueMs: 0,
-            videoQueueLength: 0,
-            firstFrameTimeMs: 0,
-            currentTimeMs: 0
-        };
-        this.frameTicks = 0;
-        this.lastFpsAt = performance.now();
-    }
-    patch(values) {
-        this.stats = { ...this.stats, ...values };
-    }
-    markDecoded() {
-        this.stats.decodedFrames += 1;
-    }
-    markDropped() {
-        this.stats.droppedFrames += 1;
-    }
-    markRendered() {
-        this.frameTicks += 1;
-        const now = performance.now();
-        if (now - this.lastFpsAt >= 1000) {
-            this.stats.fps = this.frameTicks;
-            this.frameTicks = 0;
-            this.lastFpsAt = now;
-        }
-    }
-    snapshot() {
-        this.patch({
-            videoTagCount: document.querySelectorAll('video').length,
-            canvasCount: document.querySelectorAll('canvas').length
-        });
-        return { ...this.stats };
-    }
+    const supported = webAudio && (!requireWebCodecs || (webCodecsVideo && webCodecsAudio));
+    const reason = supported ? undefined : 'This no-video path requires WebAudio and WebCodecs, or an enabled WASM decoder fallback.';
+    return { webCodecsVideo, webCodecsAudio, webAudio, webGL, wasm, supported, reason };
 }
 
 const PLAYBACK_PRESETS = {
@@ -519,7 +602,7 @@ const PLAYBACK_PRESETS = {
     }
 };
 
-class TeslaStandalonePlayer {
+class HlsWebCodecsEngine {
     constructor(options) {
         this.options = options;
         this.events = new PlayerEvents();
@@ -530,8 +613,14 @@ class TeslaStandalonePlayer {
         this.firstFrameSeen = false;
         this.videoQueueLength = 0;
         this.stopped = false;
+        this.paused = false;
+        this.pausedAtMs = 0;
+        this.sourceType = 'hls';
+        this.currentUrl = '';
+        this.mp4PullOutstanding = 0;
         this.videoConfigured = false;
         this.audioConfigured = false;
+        this.seenKeyFrame = false;
         this.pendingVideoSamples = [];
         this.pendingAudioSamples = [];
         this.renderQueue = [];
@@ -549,6 +638,10 @@ class TeslaStandalonePlayer {
         this.canvas = document.createElement('canvas');
         this.canvas.style.width = '100%';
         this.canvas.style.height = '100%';
+        this.canvas.style.maxWidth = '100%';
+        this.canvas.style.maxHeight = '100%';
+        this.canvas.style.position = 'absolute';
+        this.canvas.style.inset = '0';
         this.canvas.style.display = 'block';
         this.canvas.style.objectFit = 'contain';
         this.canvas.style.background = '#000';
@@ -556,13 +649,18 @@ class TeslaStandalonePlayer {
         this.updateSettings(options);
         this.renderer = this.createRenderer(options.renderer || 'webgl');
         this.stats.patch({ rendererType: this.renderer.type });
+        this.stats.patch({ sourceType: 'hls', audioType: 'webaudio' });
         this.guard.start(count => this.fail(new Error(`video elements are forbidden, found ${count}.`)));
     }
-    async play(url) {
+    async play(url, sourceType = 'hls', startTime = 0) {
         if (!url)
-            throw new Error('HTTP-FLV URL is required.');
+            throw new Error('Playback URL is required.');
         this.stop();
         this.stopped = false;
+        this.paused = false;
+        this.sourceType = sourceType;
+        this.currentUrl = url;
+        this.mp4PullOutstanding = 0;
         this.firstFrameStart = performance.now();
         this.firstFrameSeen = false;
         this.state.transition('loading');
@@ -583,31 +681,57 @@ class TeslaStandalonePlayer {
             onError: error => this.fail(error)
         });
         this.stats.patch({ decoderType: 'webcodecs' });
-        this.worker = new Worker(this.options.workerUrl || new URL('./http-flv-worker.js', import.meta.url), { type: 'module' });
+        this.worker = new Worker(this.options.workerUrl || new URL('./worker-entry.js', import.meta.url), { type: 'module' });
         this.worker.onmessage = event => this.handleWorkerEvent(event.data);
         this.worker.onerror = event => this.fail(new Error(event.message || 'HTTP-FLV worker failed.'));
-        const isHls = /\.m3u8(\?|$)/i.test(url);
-        this.worker.postMessage({
-            type: isHls ? 'open-hls' : 'open-http-flv',
-            url,
-            liveStartSegmentCount: this.settings.liveStartSegmentCount,
-            liveSegmentBatch: this.settings.liveSegmentBatch
-        });
+        if (sourceType === 'mp4')
+            this.worker.postMessage({ type: 'open-mp4', url, startTime });
+        else if (sourceType === 'hls')
+            this.worker.postMessage({
+                type: 'open-hls', url,
+                liveStartSegmentCount: this.settings.liveStartSegmentCount,
+                liveSegmentBatch: this.settings.liveSegmentBatch,
+                startTime
+            });
+        else
+            this.worker.postMessage({ type: sourceType === 'ws-flv' ? 'open-ws-flv' : 'open-http-flv', url });
     }
     pause() {
+        if (this.paused || this.stopped)
+            return;
+        this.paused = true;
+        this.pausedAtMs = performance.now();
         this.worker?.postMessage({ type: 'pause' });
         this.audio?.pause();
         this.state.transition('paused');
         this.events.emit('state', this.state.current);
     }
     async resume() {
+        if (!this.paused || this.stopped)
+            return;
+        const pausedDuration = performance.now() - this.pausedAtMs;
+        if (this.videoWallClockBaseMs !== undefined)
+            this.videoWallClockBaseMs += pausedDuration;
+        this.paused = false;
         await this.audio?.resume();
         this.worker?.postMessage({ type: 'resume' });
         this.state.transition('playing');
         this.events.emit('state', this.state.current);
+        if (this.pendingVideoSamples.length || this.pendingAudioSamples.length)
+            this.ensureDecodePump();
+        if (this.renderQueue.length)
+            this.ensureRenderLoop();
+    }
+    async seek(time) {
+        if (this.sourceType !== 'mp4' && this.sourceType !== 'hls')
+            throw new Error('seek() is available for MP4 and HLS on-demand playback only.');
+        this.state.transition('seeking');
+        this.events.emit('state', this.state.current);
+        await this.play(this.currentUrl, this.sourceType, Math.max(0, Number(time) || 0));
     }
     stop() {
         this.stopped = true;
+        this.paused = false;
         this.worker?.postMessage({ type: 'stop' });
         this.worker?.terminate();
         this.worker = undefined;
@@ -618,8 +742,10 @@ class TeslaStandalonePlayer {
         this.videoQueueLength = 0;
         this.videoConfigured = false;
         this.audioConfigured = false;
+        this.seenKeyFrame = false;
         this.pendingVideoSamples = [];
         this.pendingAudioSamples = [];
+        this.mp4PullOutstanding = 0;
         this.videoWallClockBaseUs = undefined;
         this.videoWallClockBaseMs = undefined;
         this.clearDecodePump();
@@ -643,8 +769,13 @@ class TeslaStandalonePlayer {
         this.audio?.setVolume(value);
     }
     getStats() {
+        const audioDiagnostics = this.audio?.diagnostics();
         this.stats.patch({
             audioQueueMs: this.audio?.queuedMs() || 0,
+            audioDecodedFrames: audioDiagnostics?.enqueuedFrames || 0,
+            audioScheduledSources: audioDiagnostics?.scheduledSources || 0,
+            audioFrameSamples: audioDiagnostics?.lastFrameSamples || 0,
+            audioContextState: audioDiagnostics?.contextState || 'closed',
             videoQueueLength: this.videoQueueLength,
             currentTimeMs: this.audio?.currentTimeMs() || 0
         });
@@ -702,6 +833,11 @@ class TeslaStandalonePlayer {
             else if (message.type === 'stream-end') {
                 this.events.emit('log', 'Stream ended.');
             }
+            else if (message.type === 'media-info') {
+                this.stats.patch({ duration: message.duration });
+                this.events.emit('log', `Media info: ${message.videoCodec || 'no video'} / ${message.audioCodec || 'no audio'}, ${message.duration.toFixed(2)}s.`);
+                this.ensureMp4Pull();
+            }
             else if (message.type === 'video-config') {
                 this.events.emit('log', `Video config received: ${message.codec}${message.annexb ? ' annexb' : ''}`);
                 this.decoder?.configureVideo(message).then(() => {
@@ -714,25 +850,31 @@ class TeslaStandalonePlayer {
                 this.events.emit('log', `Audio config received: ${message.codec} ${message.sampleRate}Hz/${message.numberOfChannels}ch`);
                 this.decoder?.configureAudio(message).then(() => {
                     this.audioConfigured = true;
-                    const samples = this.pendingAudioSamples.splice(0);
-                    for (const sample of samples)
-                        this.decoder?.decodeAudio(sample);
+                    this.ensureDecodePump();
                 }).catch(error => this.fail(error));
             }
             else if (message.type === 'video-sample') {
+                if (this.sourceType === 'mp4')
+                    this.mp4PullOutstanding = Math.max(0, this.mp4PullOutstanding - 1);
+                if (!this.seenKeyFrame) {
+                    if (!message.key)
+                        return;
+                    this.seenKeyFrame = true;
+                }
                 this.videoQueueLength += 1;
                 this.pendingVideoSamples.push(message);
                 if (this.videoConfigured)
                     this.ensureDecodePump();
             }
             else if (message.type === 'audio-sample') {
+                if (this.sourceType === 'mp4')
+                    this.mp4PullOutstanding = Math.max(0, this.mp4PullOutstanding - 1);
+                this.pendingAudioSamples.push(message);
                 if (this.audioConfigured)
-                    this.decoder?.decodeAudio(message);
-                else
-                    this.pendingAudioSamples.push(message);
+                    this.ensureDecodePump();
             }
             else if (message.type === 'stats') {
-                this.stats.patch({ videoTagCount: message.videoTagCount });
+                this.stats.patch({ videoTagCount: message.videoTagCount, audioSampleCount: message.audioTagCount });
             }
             else if (message.type === 'log') {
                 this.events.emit('log', message.message);
@@ -781,25 +923,42 @@ class TeslaStandalonePlayer {
     ensureRenderLoop() {
         if (this.renderLoopId !== undefined)
             return;
-        this.renderLoopId = requestAnimationFrame(() => this.renderTick());
+        this.renderLoopId = window.setTimeout(() => this.renderTick(), 8);
     }
     ensureDecodePump() {
         if (this.decodePumpId !== undefined)
             return;
-        this.decodePumpId = requestAnimationFrame(() => this.decodeTick());
+        this.decodePumpId = window.setTimeout(() => this.decodeTick(), 0);
     }
     decodeTick() {
         this.decodePumpId = undefined;
-        if (this.stopped || !this.videoConfigured)
+        if (this.stopped || this.paused)
             return;
-        let budget = this.settings.decodeBatchSize;
-        while (budget > 0 && this.pendingVideoSamples.length > 0 && this.renderQueue.length < 150) {
+        let videoBudget = this.settings.decodeBatchSize;
+        while (this.videoConfigured && videoBudget > 0 && this.pendingVideoSamples.length > 0 && this.renderQueue.length < 150) {
             const sample = this.pendingVideoSamples.shift();
             this.decoder?.decodeVideo(sample);
-            budget -= 1;
+            videoBudget -= 1;
         }
-        if (this.pendingVideoSamples.length > 0)
+        // Audio has its own budget. Sharing the video budget starves AAC whenever
+        // a live segment leaves a persistent video backlog.
+        let audioBudget = Math.max(4, this.settings.decodeBatchSize * 2);
+        while (this.audioConfigured && audioBudget > 0 && this.pendingAudioSamples.length > 0
+            && (this.audio?.queuedMs() || 0) < this.settings.audioMaxQueueMs * 1.25
+            && (this.decoder?.audioDecodeQueueSize() || 0) < 32) {
+            this.decoder?.decodeAudio(this.pendingAudioSamples.shift());
+            audioBudget -= 1;
+        }
+        this.ensureMp4Pull();
+        if ((this.videoConfigured && this.pendingVideoSamples.length > 0 && this.renderQueue.length < 150)
+            || (this.audioConfigured && this.pendingAudioSamples.length > 0
+                && (this.audio?.queuedMs() || 0) < this.settings.audioMaxQueueMs * 1.25
+                && (this.decoder?.audioDecodeQueueSize() || 0) < 32)) {
             this.ensureDecodePump();
+        }
+        else if (this.pendingAudioSamples.length > 0) {
+            this.decodePumpId = window.setTimeout(() => this.decodeTick(), 25);
+        }
     }
     renderTick() {
         this.renderLoopId = undefined;
@@ -807,6 +966,8 @@ class TeslaStandalonePlayer {
             this.clearRenderQueue();
             return;
         }
+        if (this.paused)
+            return;
         while (this.renderQueue.length > 0 && this.videoDelayMs(this.renderQueue[0].timestamp) < -this.settings.lateDropMs) {
             const late = this.renderQueue.shift();
             try {
@@ -834,8 +995,12 @@ class TeslaStandalonePlayer {
         }
         if (this.renderQueue.length > 0)
             this.ensureRenderLoop();
+        this.ensureMp4Pull();
     }
     videoDelayMs(timestamp) {
+        const audioDelay = this.audioConfigured ? this.audio?.delayUntilMediaTimeMs(timestamp) : undefined;
+        if (audioDelay !== undefined)
+            return audioDelay;
         if (this.videoWallClockBaseUs !== undefined && this.videoWallClockBaseMs !== undefined) {
             return this.videoWallClockBaseMs + (timestamp - this.videoWallClockBaseUs) / 1000 - performance.now();
         }
@@ -864,7 +1029,7 @@ class TeslaStandalonePlayer {
     }
     clearRenderQueue() {
         if (this.renderLoopId !== undefined) {
-            cancelAnimationFrame(this.renderLoopId);
+            clearTimeout(this.renderLoopId);
             this.renderLoopId = undefined;
         }
         for (const item of this.renderQueue) {
@@ -877,16 +1042,420 @@ class TeslaStandalonePlayer {
     }
     clearDecodePump() {
         if (this.decodePumpId !== undefined) {
-            cancelAnimationFrame(this.decodePumpId);
+            clearTimeout(this.decodePumpId);
             this.decodePumpId = undefined;
         }
     }
+    ensureMp4Pull() {
+        if (this.sourceType !== 'mp4' || this.stopped || this.paused || !this.worker)
+            return;
+        const buffered = this.pendingVideoSamples.length + this.pendingAudioSamples.length + this.renderQueue.length;
+        if (buffered + this.mp4PullOutstanding >= 320 || (this.audio?.queuedMs() || 0) > this.settings.audioMaxQueueMs * 1.5)
+            return;
+        const count = 320 - buffered - this.mp4PullOutstanding;
+        this.mp4PullOutstanding += count;
+        this.worker.postMessage({ type: 'pull', count });
+    }
 }
 
-window.TeslaStandalonePlayer = TeslaStandalonePlayer;
-window.createTeslaPlayer = function (opts) {
-    return new TeslaStandalonePlayer(opts);
-};
+/*
+ * h265web.js integration layer.
+ *
+ * The npm package h265web.js@2.2.2 is vendored under vendor/h265webjs, but its
+ * published package does not include the actual dist/h265webjs.js runtime or
+ * wasm decoder assets referenced by its README. This engine therefore exposes
+ * the integration contract and fails with a clear error until those assets are
+ * supplied.
+ */
+let h265webLoader;
+function loadScript(url) {
+    if (window.new265webjs)
+        return Promise.resolve();
+    if (h265webLoader)
+        return h265webLoader;
+    h265webLoader = new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = url;
+        script.async = true;
+        script.onload = () => window.new265webjs ? resolve() : reject(new Error('h265web.js loaded but window.new265webjs is missing.'));
+        script.onerror = () => reject(new Error(`Failed to load h265web.js runtime: ${url}. Expected vendored asset dist/h265webjs.js is missing.`));
+        document.head.appendChild(script);
+    });
+    return h265webLoader;
+}
+class H265WebEngine {
+    constructor(container, options) {
+        this.container = container;
+        this.options = options;
+    }
+    async play(url) {
+        const runtime = this.options.h265webUrl || new URL('./h265webjs.js', import.meta.url).href;
+        await loadScript(runtime);
+        if (!window.new265webjs)
+            throw new Error('h265web.js runtime is unavailable.');
+        this.container.innerHTML = '';
+        const id = this.container.id || `tesla-h265-${Math.random().toString(16).slice(2)}`;
+        this.container.id = id;
+        this.instance = window.new265webjs(url, {
+            player: id,
+            width: this.container.clientWidth || 960,
+            height: this.container.clientHeight || 540,
+            token: '',
+            extInfo: {}
+        });
+        this.instance.do?.();
+        this.instance.play?.();
+    }
+    pause() { this.instance?.pause?.(); }
+    stop() { this.instance?.pause?.(); }
+    destroy() {
+        this.instance?.release?.();
+        this.instance?.close?.();
+        this.instance = undefined;
+    }
+    setVolume(volume) { this.instance?.setVoice?.(volume); }
+    seek(time) { this.instance?.seek?.(time); }
+}
 
-export { TeslaStandalonePlayer };
+/*
+ * Tesla-VideoPlayer runtime now delegates playback to Jessibuca OSS directly.
+ * Jessibuca is licensed under GPL-3.0. See THIRD_PARTY_NOTICES.md.
+ */
+let jessibucaLoader;
+function loadJessibuca(scriptUrl = new URL('./jessibuca.js', import.meta.url).href) {
+    if (window.Jessibuca)
+        return Promise.resolve();
+    if (jessibucaLoader)
+        return jessibucaLoader;
+    jessibucaLoader = new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = scriptUrl;
+        script.async = true;
+        script.onload = () => window.Jessibuca ? resolve() : reject(new Error('Jessibuca loaded but global constructor is missing.'));
+        script.onerror = () => reject(new Error(`Failed to load Jessibuca runtime: ${scriptUrl}`));
+        document.head.appendChild(script);
+    });
+    return jessibucaLoader;
+}
+class TeslaPlayer {
+    constructor(containerOrOptions, maybeOptions = {}) {
+        var _a, _b;
+        this.containerOrOptions = containerOrOptions;
+        this.events = new PlayerEvents();
+        this.state = new PlayerStateMachine();
+        this.stats = new PlayerStatsTracker();
+        this.guard = new NoVideoGuard();
+        this.activeEngine = 'none';
+        this.url = '';
+        this.sourceType = 'unknown';
+        this.firstFrameStart = 0;
+        this.firstFrameSeen = false;
+        this.volume = 1;
+        this.handlers = [];
+        this.on = this.events.on.bind(this.events);
+        this.off = this.events.off.bind(this.events);
+        this.options = containerOrOptions instanceof HTMLElement
+            ? { ...maybeOptions, container: containerOrOptions }
+            : containerOrOptions;
+        if (!this.options.container)
+            throw new Error('createTeslaPlayer requires a container element.');
+        (_a = this.options.container.style).position || (_a.position = 'relative');
+        (_b = this.options.container.style).background || (_b.background = '#000');
+        this.guard.start(count => this.fail(new Error(`video elements are forbidden, found ${count}.`)));
+        this.stats.patch({
+            decoderType: 'wasm',
+            rendererType: 'canvas2d',
+            audioType: 'webaudio'
+        });
+        if (this.options.url)
+            this.load(this.options.url, this.options);
+    }
+    load(url, options = {}) {
+        this.url = url;
+        this.options = { ...this.options, ...options };
+        this.sourceType = options.sourceType || inferSourceType(url);
+        this.stats.patch({ sourceType: this.sourceType, lastError: '' });
+    }
+    async play(url, options = {}) {
+        if (url)
+            this.load(url, options);
+        if (!this.url)
+            throw new Error('Playback URL is required.');
+        if (this.sourceType === 'hls' || this.sourceType === 'mp4') {
+            await this.playWithHlsEngine();
+            return;
+        }
+        if (this.sourceType === 'h265') {
+            if (!this.options.enableH265Web) {
+                this.fail(new Error('h265web.js is studied but disabled by default for Tesla no-video mode. Set enableH265Web only after supplying its missing runtime/wasm assets.'));
+                return;
+            }
+            await this.playWithH265WebEngine();
+            return;
+        }
+        await this.ensureJessibuca();
+        this.firstFrameStart = performance.now();
+        this.firstFrameSeen = false;
+        this.state.transition('loading');
+        this.events.emit('state', this.state.current);
+        await this.jess.play(this.url);
+    }
+    pause() {
+        if (this.activeEngine === 'hls')
+            this.hls?.pause();
+        else if (this.activeEngine === 'h265web')
+            this.h265?.pause();
+        else
+            this.jess?.pause().catch(error => this.fail(error));
+        this.state.transition('paused');
+        this.events.emit('state', this.state.current);
+    }
+    async resume() {
+        if (this.activeEngine === 'hls')
+            await this.hls?.resume();
+        else if (this.activeEngine === 'h265web')
+            await this.h265?.play(this.url);
+        else
+            await this.jess?.play();
+    }
+    stop() {
+        if (this.activeEngine === 'hls')
+            this.hls?.stop();
+        else if (this.activeEngine === 'h265web')
+            this.h265?.stop();
+        else
+            this.jess?.close();
+        this.state.transition('stopped');
+        this.events.emit('state', this.state.current);
+    }
+    destroy() {
+        this.jess?.destroy();
+        this.hls?.destroy();
+        this.h265?.destroy();
+        this.jess = undefined;
+        this.hls = undefined;
+        this.h265 = undefined;
+        this.handlers = [];
+        this.guard.stop();
+        this.events.clear();
+        this.state.transition('destroyed');
+    }
+    seek(time) {
+        if (this.activeEngine === 'hls' && (this.sourceType === 'mp4' || this.sourceType === 'hls')) {
+            this.hls?.seek(time).catch(error => this.fail(error instanceof Error ? error : new Error(String(error))));
+            return;
+        }
+        this.fail(new Error(`seek() is only supported for MP4/HLS on-demand playback; current source is ${this.sourceType}.`));
+    }
+    setVolume(volume) {
+        this.volume = Math.max(0, Math.min(1, Number(volume) || 0));
+        this.jess?.setVolume(this.volume);
+        this.hls?.setVolume(this.volume);
+        this.h265?.setVolume(this.volume);
+    }
+    setPlaybackRate(rate) {
+        this.events.emit('log', `Jessibuca FLV live playbackRate is not exposed; requested ${rate}.`);
+    }
+    screenshot() {
+        if (this.activeEngine === 'hls') {
+            const canvas = this.options.container.querySelector('canvas');
+            return canvas ? canvas.toDataURL('image/png') : '';
+        }
+        const result = this.jess?.screenshot('tesla-frame', 'png', 1, 'base64');
+        return typeof result === 'string' ? result : '';
+    }
+    fullscreen() {
+        const target = this.options.container;
+        if (document.fullscreenElement)
+            document.exitFullscreen().catch(() => undefined);
+        else
+            target.requestFullscreen?.().catch(() => undefined);
+    }
+    getStats() {
+        if (this.activeEngine === 'hls' && this.hls) {
+            return { ...this.hls.getStats(), sourceType: this.sourceType };
+        }
+        return this.stats.snapshot();
+    }
+    getState() {
+        return this.state.current;
+    }
+    async ensureJessibuca() {
+        if (this.jess)
+            return;
+        this.hls?.destroy();
+        this.hls = undefined;
+        this.activeEngine = 'jessibuca';
+        await loadJessibuca(this.options.jessibucaUrl || new URL('./jessibuca.js', import.meta.url).href);
+        const Jessibuca = window.Jessibuca;
+        if (!Jessibuca)
+            throw new Error('Jessibuca constructor is not available.');
+        this.options.container.innerHTML = '';
+        this.jess = new Jessibuca({
+            container: this.options.container,
+            decoder: this.options.decoderUrl || new URL('./decoder.js', import.meta.url).href,
+            videoBuffer: this.options.videoBuffer ?? 0.2,
+            isResize: this.options.fitMode !== 'fill',
+            isFullResize: this.options.fitMode === 'cover',
+            hasAudio: true,
+            isNotMute: this.volume > 0,
+            useMSE: false,
+            useWCS: false,
+            autoWasm: true,
+            debug: !!this.options.debug,
+            loadingText: this.options.loadingText || 'loading',
+            showBandwidth: true,
+            operateBtns: {
+                fullscreen: true,
+                screenshot: true,
+                play: true,
+                audio: true,
+                record: false
+            },
+            heartTimeoutReplay: true,
+            heartTimeoutReplayTimes: 3,
+            loadingTimeoutReplay: true,
+            loadingTimeoutReplayTimes: 3,
+            wasmDecodeErrorReplay: true
+        });
+        this.bindJessibucaEvents(this.jess);
+        this.jess.setVolume(this.volume);
+    }
+    async playWithHlsEngine() {
+        this.jess?.destroy();
+        this.jess = undefined;
+        this.h265?.destroy();
+        this.h265 = undefined;
+        if (!this.hls) {
+            this.options.container.innerHTML = '';
+            this.hls = new HlsWebCodecsEngine({
+                container: this.options.container,
+                renderer: this.options.renderer === 'canvas' ? 'canvas2d' : 'webgl',
+                workerUrl: this.options.workerUrl,
+                fitMode: this.options.fitMode,
+                liveStartSegmentCount: this.options.liveStartSegmentCount ?? 3,
+                liveSegmentBatch: this.options.liveSegmentBatch ?? 2,
+                audioMaxQueueMs: this.options.audioMaxQueueMs ?? 1200,
+                decodeBatchSize: this.options.decodeBatchSize,
+                maxRenderQueue: this.options.maxRenderQueue,
+                lateDropMs: this.options.lateDropMs
+            });
+            this.bindHlsEvents(this.hls);
+            this.hls.setVolume(this.volume);
+        }
+        this.activeEngine = 'hls';
+        this.stats.patch({ sourceType: this.sourceType, decoderType: 'webcodecs', rendererType: this.options.renderer === 'canvas' ? 'canvas2d' : 'webgl', audioType: 'webaudio' });
+        await this.hls.play(this.url, this.sourceType);
+    }
+    async playWithH265WebEngine() {
+        this.jess?.destroy();
+        this.jess = undefined;
+        this.hls?.destroy();
+        this.hls = undefined;
+        if (!this.h265)
+            this.h265 = new H265WebEngine(this.options.container, this.options);
+        this.activeEngine = 'h265web';
+        this.state.transition('loading');
+        this.stats.patch({
+            sourceType: 'h265',
+            decoderType: 'wasm',
+            rendererType: 'canvas2d',
+            audioType: 'webaudio',
+            lastError: ''
+        });
+        this.events.emit('state', this.state.current);
+        try {
+            await this.h265.play(this.url);
+            this.state.transition('playing');
+            this.events.emit('state', this.state.current);
+        }
+        catch (error) {
+            this.fail(error instanceof Error ? error : new Error(String(error)));
+        }
+    }
+    bindHlsEvents(engine) {
+        engine.events.on('state', state => {
+            this.state.transition(state);
+            this.events.emit('state', this.state.current);
+        });
+        engine.events.on('error', error => this.fail(error));
+        engine.events.on('log', message => this.events.emit('log', message));
+        engine.events.on('firstFrame', ms => {
+            this.stats.patch({ firstFrameTimeMs: ms });
+            this.events.emit('firstFrame', ms);
+        });
+    }
+    bindJessibucaEvents(jess) {
+        const bind = (event, handler) => {
+            jess.on(event, handler);
+            this.handlers.push({ event, handler });
+        };
+        bind('load', () => this.events.emit('log', 'Jessibuca loaded.'));
+        bind('start', () => this.markPlaying());
+        bind('play', () => this.markPlaying());
+        bind('error', (error) => this.fail(new Error(typeof error === 'string' ? error : JSON.stringify(error))));
+        bind('timeout', (payload) => this.fail(new Error(`Jessibuca timeout: ${JSON.stringify(payload)}`)));
+        bind('videoInfo', (info) => {
+            this.events.emit('log', `Video ${info?.encType || ''} ${info?.width || 0}x${info?.height || 0}`);
+        });
+        bind('audioInfo', (info) => {
+            this.events.emit('log', `Audio ${info?.encType || ''} ${info?.sampleRate || 0}Hz/${info?.channels || 0}ch`);
+        });
+        bind('stats', (payload) => {
+            const stats = typeof payload === 'string' ? safeJson(payload) : payload || {};
+            this.stats.patch({
+                fps: Number(stats.fps) || 0,
+                audioQueueMs: Number(stats.buf) || 0,
+                currentTime: Number(stats.ts) ? Number(stats.ts) / 1000 : 0,
+                currentTimeMs: Number(stats.ts) || 0,
+                bitrate: Math.round(((Number(stats.abps) || 0) + (Number(stats.vbps) || 0)) / 1000)
+            });
+            this.events.emit('stats', this.getStats());
+        });
+        bind('kBps', (value) => {
+            const kbps = Number(value);
+            if (Number.isFinite(kbps))
+                this.stats.patch({ bitrate: Math.round(kbps * 8) });
+        });
+    }
+    markPlaying() {
+        if (!this.firstFrameSeen) {
+            this.firstFrameSeen = true;
+            const firstFrameTimeMs = Math.round(performance.now() - this.firstFrameStart);
+            this.stats.patch({ firstFrameTimeMs });
+            this.events.emit('firstFrame', firstFrameTimeMs);
+        }
+        this.state.transition('playing');
+        this.events.emit('state', this.state.current);
+    }
+    fail(error) {
+        this.state.transition('error');
+        this.stats.patch({ lastError: error.message });
+        this.events.emit('state', this.state.current);
+        this.events.emit('error', error);
+    }
+}
+function safeJson(text) {
+    try {
+        return JSON.parse(text);
+    }
+    catch {
+        return {};
+    }
+}
+function createTeslaPlayer(container, options = {}) {
+    return new TeslaPlayer(container, options);
+}
+
+/*
+ * Tesla-VideoPlayer public entry.
+ * Based on Jessibuca open source architecture and distributed under GPL-3.0.
+ */
+if (typeof window !== 'undefined') {
+    window.TeslaPlayer = TeslaPlayer;
+    window.TeslaStandalonePlayer = TeslaPlayer;
+    window.createTeslaPlayer = createTeslaPlayer;
+}
+
+export { TeslaPlayer, TeslaPlayer as TeslaStandalonePlayer, createTeslaPlayer };
 //# sourceMappingURL=index.js.map

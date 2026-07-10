@@ -6,6 +6,7 @@ export interface HLSSegment {
   duration: number;   // 秒
   seq: number;        // 媒体序列号
   discontinuity?: boolean; // 是否在该分片前存在 DISCONTINUITY
+  key?: HLSKeyInfo;
 }
 export interface HLSKeyInfo {
   method: 'AES-128' | 'SAMPLE-AES' | 'NONE';
@@ -60,7 +61,7 @@ export function parseM3U8(text: string, base?: string): HLSPlaylistParsed {
       }));
       const method = (attrs['METHOD'] || 'NONE') as any;
       if (method === 'AES-128') {
-        key = { method: 'AES-128', uri: attrs['URI'], ivHex: attrs['IV'] };
+        key = { method: 'AES-128', uri: attrs['URI'] && base ? new URL(attrs['URI'], base).href : attrs['URI'], ivHex: attrs['IV'] };
       } else if (method === 'NONE') {
         key = { method: 'NONE' } as any;
       } else {
@@ -75,7 +76,7 @@ export function parseM3U8(text: string, base?: string): HLSPlaylistParsed {
     }
     if (!line.startsWith('#')) {
       const abs = base ? new URL(line, base).href : line;
-      segs.push({ uri: abs, duration, seq, discontinuity: sawDiscontinuity || undefined });
+      segs.push({ uri: abs, duration, seq, discontinuity: sawDiscontinuity || undefined, key: key ? { ...key } : undefined });
       seq++;
       duration = 0;
       sawDiscontinuity = false;
