@@ -4,6 +4,7 @@ import { demuxTS, TSSample } from './ts/demux-ts';
 import { extractSpsPps } from './bsf/h264-annexb-avcc';
 import { demuxMp4, type Mp4DemuxSession } from './mp4/mp4box-demuxer';
 import { decryptAes128CbcPkcs7, hexToBytes, seqToIv } from './hls/aes';
+import { isUsableMediaTimestamp } from './media-timestamp';
 
 // No-video worker for HTTP/WS FLV, HLS/TS and MP4 sample extraction.
 let aborter: AbortController | null = null;
@@ -372,7 +373,7 @@ async function openHls(url: string, options: { liveStartSegmentCount?: number; l
           segmentData = await decryptAes128CbcPkcs7(segmentData, keyData, iv);
         }
         const samples = demuxTS(segmentData)
-          .filter(sample => Number.isFinite(sample.tsUs) && sample.tsUs > 0);
+          .filter(sample => isUsableMediaTimestamp(sample.tsUs));
         lastSeq = segment.seq;
         hlsSeqCount += 1;
 

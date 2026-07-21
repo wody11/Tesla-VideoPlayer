@@ -68,7 +68,7 @@ export class TeslaPlayer {
     if (!this.options.container) throw new Error('createTeslaPlayer requires a container element.');
     this.options.container.style.position ||= 'relative';
     this.options.container.style.background ||= '#000';
-    this.guard.start(count => this.fail(new Error(`video elements are forbidden, found ${count}.`)));
+    this.guard.start(count => this.fail(new Error(`video elements are forbidden, found ${count}.`)), this.options.container);
     this.stats.patch({
       decoderType: 'wasm',
       rendererType: 'canvas2d',
@@ -342,6 +342,11 @@ export class TeslaPlayer {
   }
 
   private fail(error: Error): void {
+    if (this.state.current === 'destroyed') return;
+    if (this.activeEngine === 'hls') this.hls?.stop();
+    else if (this.activeEngine === 'h265web') this.h265?.stop();
+    else this.jess?.close();
+    this.activeEngine = 'none';
     this.state.transition('error');
     this.stats.patch({ lastError: error.message });
     this.events.emit('state', this.state.current);

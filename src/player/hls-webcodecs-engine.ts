@@ -3,12 +3,13 @@ import { WebCodecsDecoder } from '../decoder/webcodecs-decoder';
 import { CanvasRenderer } from '../render/canvas-renderer';
 import { WebGLRenderer } from '../render/webgl-renderer';
 import { detectCapability } from '../utils/capability';
-import { NoVideoGuard } from '../utils/no-video-guard';
 import { PlayerEvents } from './player-events';
 import { PlayerStateMachine } from './player-state';
 import { PlayerStatsTracker, TeslaPlayerStats } from './player-stats';
 import { PLAYBACK_PRESETS, PlaybackPresetName } from './playback-strategy';
 import type { TeslaWorkerEvent } from '../worker/worker-protocol';
+import { SessionGeneration } from '../utils/session-generation';
+import { canDecodeVideo, trimLiveVideoQueue } from './playback-flow';
 
 // Tesla no-video engine: MP4/HLS/FLV -> worker demux -> WebCodecs -> Canvas/WebGL/WebAudio.
 export interface HlsWebCodecsEngineOptions {
@@ -29,7 +30,7 @@ export class HlsWebCodecsEngine {
   readonly events = new PlayerEvents();
   private state = new PlayerStateMachine();
   private stats = new PlayerStatsTracker();
-  private guard = new NoVideoGuard();
+  private sessions = new SessionGeneration();
   private canvas: HTMLCanvasElement;
   private renderer: CanvasRenderer | WebGLRenderer;
   private audio?: WebAudioPlayer;
@@ -38,7 +39,7 @@ export class HlsWebCodecsEngine {
   private firstFrameStart = 0;
   private firstFrameSeen = false;
   private videoQueueLength = 0;
-  private stopped = false;
+  private stopped = true;
   private paused = false;
   private pausedAtMs = 0;
   private sourceType: 'hls' | 'mp4' | 'http-flv' | 'ws-flv' = 'hls';
@@ -81,14 +82,16 @@ export class HlsWebCodecsEngine {
     this.renderer = this.createRenderer(options.renderer || 'webgl');
     this.stats.patch({ rendererType: this.renderer.type });
     this.stats.patch({ sourceType: 'hls', audioType: 'webaudio' });
-    this.guard.start(count => this.fail(new Error(`video elements are forbidden, found ${count}.`)));
   }
 
   on = this.events.on.bind(this.events);
 
   async play(url: string, sourceType: 'hls' | 'mp4' | 'http-flv' | 'ws-flv' = 'hls', startTime = 0): Promise<void> {
     if (!url) throw new Error('Playback URL is required.');
-    this.stop();
+
+    // Make every callback from the previous playback stale before releasing it.
+    const sessionId = this.sessions.begin();
+    this.releasePlaybackResources();
     this.stopped = false;
     this.paused = false;
     this.sourceType = sourceType;
@@ -102,32 +105,46 @@ export class HlsWebCodecsEngine {
     const capability = detectCapability(this.canvas);
     if (!capability.supported) {
       this.stats.patch({ decoderType: 'unsupported' });
-      throw new Error(capability.reason || 'Required browser capability is not available.');
+      const error = new Error(capability.reason || 'Required browser capability is not available.');
+      this.fail(error, sessionId);
+      throw error;
     }
 
-    this.audio = new WebAudioPlayer();
-    this.audio.setMaxQueueMs(this.settings.audioMaxQueueMs);
-    this.audio.resume().catch(error => {
-      this.events.emit('log', `AudioContext resume is pending or blocked: ${error?.message || error}`);
-    });
-    this.decoder = new WebCodecsDecoder({
-      onVideoFrame: frame => this.handleVideoFrame(frame),
-      onAudioFrame: frame => this.handleAudioFrame(frame),
-      onError: error => this.fail(error)
-    });
-    this.stats.patch({ decoderType: 'webcodecs' });
+    try {
+      const audio = new WebAudioPlayer();
+      this.audio = audio;
+      audio.setMaxQueueMs(this.settings.audioMaxQueueMs);
+      audio.resume().catch(error => {
+        if (this.sessions.isCurrent(sessionId)) {
+          this.events.emit('log', `AudioContext resume is pending or blocked: ${error?.message || error}`);
+        }
+      });
 
-    this.worker = new Worker(this.options.workerUrl || new URL('./worker-entry.js', import.meta.url), { type: 'module' });
-    this.worker.onmessage = event => this.handleWorkerEvent(event.data as TeslaWorkerEvent);
-    this.worker.onerror = event => this.fail(new Error(event.message || 'HTTP-FLV worker failed.'));
-    if (sourceType === 'mp4') this.worker.postMessage({ type: 'open-mp4', url, startTime });
-    else if (sourceType === 'hls') this.worker.postMessage({
-      type: 'open-hls', url,
-      liveStartSegmentCount: this.settings.liveStartSegmentCount,
-      liveSegmentBatch: this.settings.liveSegmentBatch,
-      startTime
-    });
-    else this.worker.postMessage({ type: sourceType === 'ws-flv' ? 'open-ws-flv' : 'open-http-flv', url });
+      const decoder = new WebCodecsDecoder({
+        onVideoFrame: frame => this.handleVideoFrame(frame, sessionId),
+        onAudioFrame: frame => this.handleAudioFrame(frame, sessionId),
+        onError: error => this.fail(error, sessionId)
+      });
+      this.decoder = decoder;
+      this.stats.patch({ decoderType: 'webcodecs' });
+
+      const worker = new Worker(this.options.workerUrl || new URL('./worker-entry.js', import.meta.url), { type: 'module' });
+      this.worker = worker;
+      worker.onmessage = event => this.handleWorkerEvent(event.data as TeslaWorkerEvent, sessionId);
+      worker.onerror = event => this.fail(new Error(event.message || 'Playback worker failed.'), sessionId);
+      if (sourceType === 'mp4') worker.postMessage({ type: 'open-mp4', url, startTime });
+      else if (sourceType === 'hls') worker.postMessage({
+        type: 'open-hls', url,
+        liveStartSegmentCount: this.settings.liveStartSegmentCount,
+        liveSegmentBatch: this.settings.liveSegmentBatch,
+        startTime
+      });
+      else worker.postMessage({ type: sourceType === 'ws-flv' ? 'open-ws-flv' : 'open-http-flv', url });
+    } catch (error: any) {
+      const normalized = error instanceof Error ? error : new Error(String(error));
+      this.fail(normalized, sessionId);
+      throw normalized;
+    }
   }
 
   pause(): void {
@@ -142,15 +159,17 @@ export class HlsWebCodecsEngine {
 
   async resume(): Promise<void> {
     if (!this.paused || this.stopped) return;
+    const sessionId = this.sessions.current;
     const pausedDuration = performance.now() - this.pausedAtMs;
     if (this.videoWallClockBaseMs !== undefined) this.videoWallClockBaseMs += pausedDuration;
-    this.paused = false;
     await this.audio?.resume();
+    if (!this.sessions.isCurrent(sessionId)) return;
+    this.paused = false;
     this.worker?.postMessage({ type: 'resume' });
     this.state.transition('playing');
     this.events.emit('state', this.state.current);
-    if (this.pendingVideoSamples.length || this.pendingAudioSamples.length) this.ensureDecodePump();
-    if (this.renderQueue.length) this.ensureRenderLoop();
+    if (this.pendingVideoSamples.length || this.pendingAudioSamples.length) this.ensureDecodePump(sessionId);
+    if (this.renderQueue.length) this.ensureRenderLoop(sessionId);
   }
 
   async seek(time: number): Promise<void> {
@@ -161,34 +180,15 @@ export class HlsWebCodecsEngine {
   }
 
   stop(): void {
-    this.stopped = true;
-    this.paused = false;
-    this.worker?.postMessage({ type: 'stop' });
-    this.worker?.terminate();
-    this.worker = undefined;
-    this.decoder?.close();
-    this.decoder = undefined;
-    this.audio?.close();
-    this.audio = undefined;
-    this.videoQueueLength = 0;
-    this.videoConfigured = false;
-    this.audioConfigured = false;
-    this.seenKeyFrame = false;
-    this.pendingVideoSamples = [];
-    this.pendingAudioSamples = [];
-    this.mp4PullOutstanding = 0;
-    this.videoWallClockBaseUs = undefined;
-    this.videoWallClockBaseMs = undefined;
-    this.clearDecodePump();
-    this.clearRenderQueue();
-    try { this.renderer.clear(); } catch {}
+    this.sessions.invalidate();
+    this.releasePlaybackResources();
     this.state.transition('stopped');
     this.events.emit('state', this.state.current);
   }
 
   destroy(): void {
-    this.stop();
-    this.guard.stop();
+    this.sessions.invalidate();
+    this.releasePlaybackResources();
     this.events.clear();
     this.renderer.destroy();
     this.canvas.remove();
@@ -251,8 +251,8 @@ export class HlsWebCodecsEngine {
     }
   }
 
-  private handleWorkerEvent(message: TeslaWorkerEvent): void {
-    if (this.stopped) return;
+  private handleWorkerEvent(message: TeslaWorkerEvent, sessionId: number): void {
+    if (!this.sessions.isCurrent(sessionId) || this.stopped) return;
     try {
       if (message.type === 'stream-open') {
         this.events.emit('log', 'Stream opened.');
@@ -264,17 +264,21 @@ export class HlsWebCodecsEngine {
         this.ensureMp4Pull();
       } else if (message.type === 'video-config') {
         this.events.emit('log', `Video config received: ${message.codec}${message.annexb ? ' annexb' : ''}`);
-        this.decoder?.configureVideo(message).then(() => {
+        const decoder = this.decoder;
+        decoder?.configureVideo(message).then(() => {
+          if (!this.sessions.isCurrent(sessionId) || decoder !== this.decoder) return;
           this.videoConfigured = true;
           this.events.emit('log', `VideoDecoder configured, queued video samples: ${this.pendingVideoSamples.length}.`);
-          this.ensureDecodePump();
-        }).catch(error => this.fail(error));
+          this.ensureDecodePump(sessionId);
+        }).catch(error => this.fail(error, sessionId));
       } else if (message.type === 'audio-config') {
         this.events.emit('log', `Audio config received: ${message.codec} ${message.sampleRate}Hz/${message.numberOfChannels}ch`);
-        this.decoder?.configureAudio(message).then(() => {
+        const decoder = this.decoder;
+        decoder?.configureAudio(message).then(() => {
+          if (!this.sessions.isCurrent(sessionId) || decoder !== this.decoder) return;
           this.audioConfigured = true;
-          this.ensureDecodePump();
-        }).catch(error => this.fail(error));
+          this.ensureDecodePump(sessionId);
+        }).catch(error => this.fail(error, sessionId));
       } else if (message.type === 'video-sample') {
         if (this.sourceType === 'mp4') this.mp4PullOutstanding = Math.max(0, this.mp4PullOutstanding - 1);
         if (!this.seenKeyFrame) {
@@ -283,24 +287,37 @@ export class HlsWebCodecsEngine {
         }
         this.videoQueueLength += 1;
         this.pendingVideoSamples.push(message);
-        if (this.videoConfigured) this.ensureDecodePump();
+        if (this.sourceType !== 'mp4') {
+          const maxPending = Math.max(120, this.settings.maxRenderQueue * 4);
+          const dropped = trimLiveVideoQueue(this.pendingVideoSamples, maxPending);
+          if (dropped > 0) {
+            this.videoQueueLength = Math.max(0, this.videoQueueLength - dropped);
+            for (let i = 0; i < dropped; i += 1) this.stats.markDropped();
+            this.seenKeyFrame = this.pendingVideoSamples.length > 0;
+          }
+        }
+        if (this.videoConfigured) this.ensureDecodePump(sessionId);
       } else if (message.type === 'audio-sample') {
         if (this.sourceType === 'mp4') this.mp4PullOutstanding = Math.max(0, this.mp4PullOutstanding - 1);
         this.pendingAudioSamples.push(message);
-        if (this.audioConfigured) this.ensureDecodePump();
+        if (this.audioConfigured) this.ensureDecodePump(sessionId);
       } else if (message.type === 'stats') {
         this.stats.patch({ videoTagCount: message.videoTagCount, audioSampleCount: message.audioTagCount });
       } else if (message.type === 'log') {
         this.events.emit('log', message.message);
       } else if (message.type === 'error') {
-        this.fail(new Error(message.message));
+        this.fail(new Error(message.message), sessionId);
       }
     } catch (error: any) {
-      this.fail(error instanceof Error ? error : new Error(String(error)));
+      this.fail(error instanceof Error ? error : new Error(String(error)), sessionId);
     }
   }
 
-  private handleVideoFrame(frame: any): void {
+  private handleVideoFrame(frame: any, sessionId: number): void {
+    if (!this.sessions.isCurrent(sessionId)) {
+      try { frame.close(); } catch {}
+      return;
+    }
     const timestamp = typeof frame.timestamp === 'number' ? frame.timestamp : 0;
     if (this.videoWallClockBaseUs === undefined) {
       this.videoWallClockBaseUs = timestamp;
@@ -310,16 +327,21 @@ export class HlsWebCodecsEngine {
     this.stats.markDecoded();
     this.renderQueue.push({ frame, timestamp });
     this.renderQueue.sort((a, b) => a.timestamp - b.timestamp);
-    while (this.renderQueue.length > 180) {
+    while (this.renderQueue.length > this.settings.maxRenderQueue) {
       const old = this.renderQueue.shift();
       try { old?.frame.close(); } catch {}
       this.videoQueueLength = Math.max(0, this.videoQueueLength - 1);
       this.stats.markDropped();
     }
-    this.ensureRenderLoop();
+    this.ensureRenderLoop(sessionId);
+    if (this.pendingVideoSamples.length > 0) this.ensureDecodePump(sessionId);
   }
 
-  private handleAudioFrame(frame: any): void {
+  private handleAudioFrame(frame: any, sessionId: number): void {
+    if (!this.sessions.isCurrent(sessionId)) {
+      try { frame.close(); } catch {}
+      return;
+    }
     try {
       this.audio?.enqueue(frame);
     } finally {
@@ -327,28 +349,38 @@ export class HlsWebCodecsEngine {
     }
   }
 
-  private fail(error: Error): void {
+  private fail(error: Error, sessionId = this.sessions.current): void {
+    if (!this.sessions.isCurrent(sessionId)) return;
+    this.sessions.invalidate();
+    this.releasePlaybackResources();
+    this.stats.patch({ lastError: error.message });
     this.state.transition('error');
     this.events.emit('state', this.state.current);
     this.events.emit('error', error);
   }
 
-  private ensureRenderLoop(): void {
-    if (this.renderLoopId !== undefined) return;
-    this.renderLoopId = window.setTimeout(() => this.renderTick(), 8);
+  private ensureRenderLoop(sessionId = this.sessions.current): void {
+    if (!this.sessions.isCurrent(sessionId) || this.renderLoopId !== undefined) return;
+    this.renderLoopId = window.setTimeout(() => this.renderTick(sessionId), 8);
   }
 
-  private ensureDecodePump(): void {
-    if (this.decodePumpId !== undefined) return;
-    this.decodePumpId = window.setTimeout(() => this.decodeTick(), 0);
+  private ensureDecodePump(sessionId = this.sessions.current, delayMs = 0): void {
+    if (!this.sessions.isCurrent(sessionId) || this.decodePumpId !== undefined) return;
+    this.decodePumpId = window.setTimeout(() => this.decodeTick(sessionId), delayMs);
   }
 
-  private decodeTick(): void {
+  private decodeTick(sessionId: number): void {
     this.decodePumpId = undefined;
-    if (this.stopped || this.paused) return;
+    if (!this.sessions.isCurrent(sessionId) || this.stopped || this.paused) return;
 
     let videoBudget = this.settings.decodeBatchSize;
-    while (this.videoConfigured && videoBudget > 0 && this.pendingVideoSamples.length > 0 && this.renderQueue.length < 150) {
+    while (videoBudget > 0 && canDecodeVideo(
+      this.videoConfigured,
+      this.pendingVideoSamples.length,
+      this.renderQueue.length,
+      this.decoder?.videoDecodeQueueSize() || 0,
+      this.settings.maxRenderQueue
+    )) {
       const sample = this.pendingVideoSamples.shift()!;
       this.decoder?.decodeVideo(sample);
       videoBudget -= 1;
@@ -365,18 +397,26 @@ export class HlsWebCodecsEngine {
     }
 
     this.ensureMp4Pull();
-    if ((this.videoConfigured && this.pendingVideoSamples.length > 0 && this.renderQueue.length < 150)
-      || (this.audioConfigured && this.pendingAudioSamples.length > 0
-        && (this.audio?.queuedMs() || 0) < this.settings.audioMaxQueueMs * 1.25
-        && (this.decoder?.audioDecodeQueueSize() || 0) < 32)) {
-      this.ensureDecodePump();
-    } else if (this.pendingAudioSamples.length > 0) {
-      this.decodePumpId = window.setTimeout(() => this.decodeTick(), 25);
+    const videoCanContinue = canDecodeVideo(
+      this.videoConfigured,
+      this.pendingVideoSamples.length,
+      this.renderQueue.length,
+      this.decoder?.videoDecodeQueueSize() || 0,
+      this.settings.maxRenderQueue
+    );
+    const audioCanContinue = this.audioConfigured && this.pendingAudioSamples.length > 0
+      && (this.audio?.queuedMs() || 0) < this.settings.audioMaxQueueMs * 1.25
+      && (this.decoder?.audioDecodeQueueSize() || 0) < 32;
+    if (videoCanContinue || audioCanContinue) {
+      this.ensureDecodePump(sessionId);
+    } else if (this.pendingVideoSamples.length > 0 || this.pendingAudioSamples.length > 0) {
+      this.ensureDecodePump(sessionId, 12);
     }
   }
 
-  private renderTick(): void {
+  private renderTick(sessionId: number): void {
     this.renderLoopId = undefined;
+    if (!this.sessions.isCurrent(sessionId)) return;
     if (this.stopped) {
       this.clearRenderQueue();
       return;
@@ -405,7 +445,7 @@ export class HlsWebCodecsEngine {
         this.stats.markDropped();
     }
 
-    if (this.renderQueue.length > 0) this.ensureRenderLoop();
+    if (this.renderQueue.length > 0) this.ensureRenderLoop(sessionId);
     this.ensureMp4Pull();
   }
 
@@ -434,6 +474,35 @@ export class HlsWebCodecsEngine {
       this.videoQueueLength = Math.max(0, this.videoQueueLength - 1);
       try { frame.close(); } catch {}
     }
+  }
+
+  private releasePlaybackResources(): void {
+    this.stopped = true;
+    this.paused = false;
+    const worker = this.worker;
+    this.worker = undefined;
+    if (worker) {
+      worker.onmessage = null;
+      worker.onerror = null;
+      try { worker.postMessage({ type: 'stop' }); } catch {}
+      worker.terminate();
+    }
+    this.decoder?.close();
+    this.decoder = undefined;
+    this.audio?.close();
+    this.audio = undefined;
+    this.videoQueueLength = 0;
+    this.videoConfigured = false;
+    this.audioConfigured = false;
+    this.seenKeyFrame = false;
+    this.pendingVideoSamples = [];
+    this.pendingAudioSamples = [];
+    this.mp4PullOutstanding = 0;
+    this.videoWallClockBaseUs = undefined;
+    this.videoWallClockBaseMs = undefined;
+    this.clearDecodePump();
+    this.clearRenderQueue();
+    try { this.renderer.clear(); } catch {}
   }
 
   private clearRenderQueue(): void {
