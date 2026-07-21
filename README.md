@@ -1,77 +1,138 @@
 # Tesla-VideoPlayer
 
-Tesla-VideoPlayer is a no-video browser player rebuilt around the Jessibuca open source architecture and distributed under GPL-3.0.
+Tesla-VideoPlayer is a browser media player that keeps the playback pipeline under
+application control. Its Tesla WebCodecs path demuxes media in a Worker, decodes
+with WebCodecs, renders to Canvas/WebGL, and outputs audio through WebAudio. It
+never relies on an HTML `video` element or MSE on that path.
 
-## Origin And License
+The project also vendors the Jessibuca runtime for FLV software decoding when
+`decoderMode` is `auto` or `wasm`.
 
-This project is based on the architecture of Jessibuca open source edition:
+## Features
 
-- Jessibuca repository: https://github.com/langhuihui/jessibuca
-- Jessibuca license: GPL-3.0
-- Tesla-VideoPlayer license: GPL-3.0
-- Third-party notice: `THIRD_PARTY_NOTICES.md`
-- Vendored Jessibuca runtime: `vendor/jessibuca-runtime/`
-- Vendored Jessibuca source snapshot: `vendor/jessibuca-src/`
-- Vendored h265web.js package snapshot: `vendor/h265webjs/`
+- HTTP-FLV and WebSocket-FLV playback.
+- HLS VOD/live with MPEG-TS H.264/AAC, AES-128, master playlists, VOD seek, and
+  `EXT-X-DISCONTINUITY` resets.
+- Progressive MP4 download and incremental MP4Box demuxing.
+- WebCodecs video/audio decode with Canvas2D or WebGL rendering.
+- Session/generation isolation for rapid source switching and stale callbacks.
+- Bounded compressed, decoder, render, and audio queues.
+- Shared reconnect policy for FLV and HLS.
+- Optional built-in controls, screenshots, fullscreen, runtime stats, and a
+  container-scoped no-video guard.
 
-## Playback Goal
+## Playback routes
 
-The default Tesla path does not use HTML `video` elements and does not use MSE:
+| Source | `decoderMode` | Runtime route |
+|---|---|---|
+| HLS | `auto`, `webcodecs` | Worker demux → WebCodecs → Canvas/WebGL → WebAudio |
+| MP4 | `auto`, `webcodecs` | Progressive download → MP4Box → WebCodecs → Canvas/WebGL → WebAudio |
+| HTTP/WS FLV | `auto`, `wasm` | Jessibuca WASM → Canvas/WebGL → WebAudio |
+| HTTP/WS FLV | `webcodecs` | Worker FLV demux → WebCodecs → Canvas/WebGL → WebAudio |
+| Experimental H.265 | explicit opt-in | h265web.js integration, only when external runtime/WASM assets are supplied |
 
-`MP4 / HLS / HTTP-FLV / WS-FLV -> Worker loading and demux -> WebCodecs or WASM -> Canvas/WebGL -> WebAudio`
+HLS and MP4 reject `decoderMode: "wasm"` because the project does not yet have a
+typed software-decoder bridge for those containers.
 
-Unsupported paths report explicit errors or TODOs instead of silently falling back to video tags.
+## Requirements
 
-## Public Entry
+The WebCodecs route requires:
+
+- a browser with `VideoDecoder` and `AudioDecoder`;
+- Worker, WebAudio, Canvas2D or WebGL support;
+- CORS access to the media URL;
+- byte-range support for the most efficient MP4 playback.
+
+Serve the build from HTTP(S). Browser Worker and module loading generally do not
+work correctly from `file://` URLs.
+
+## Install and build
+
+```bash
+npm ci
+npm test
+npm run typecheck
+npm run build
+```
+
+Build output:
+
+- `dist/index.js`: public player API;
+- `dist/worker-entry.js`: the only Tesla playback Worker entry;
+- vendored Jessibuca runtime assets copied into `dist/`.
+
+## Quick start
 
 ```ts
 import { createTeslaPlayer } from './dist/index.js';
 
-const player = createTeslaPlayer(document.querySelector('#player')!, {
+const container = document.querySelector<HTMLElement>('#player');
+if (!container) throw new Error('Player container is missing.');
+
+const player = createTeslaPlayer(container, {
   decoderMode: 'auto',
   renderer: 'webgl',
-  controls: true
+  fitMode: 'contain',
+  controls: true,
+  autoplay: false,
+  preset: 'balanced',
+  volume: 0.8,
+  reconnect: true,
+  reconnectMaxRetries: 3,
+  reconnectDelayMs: 1000
 });
 
-player.load('https://example.com/live.flv');
+player.on('state', state => console.log('state', state));
+player.on('error', error => console.error(error));
+player.on('reconnect', attempt => console.log('reconnect attempt', attempt));
+
+player.load('https://example.com/live.m3u8', { sourceType: 'hls' });
 await player.play();
 ```
 
-## API
+For extensionless or signed URLs, always pass `sourceType` explicitly because
+URL inference otherwise treats generic HTTP(S) URLs as HTTP-FLV.
 
-- `load(url, options)`
-- `play()`
-- `pause()`
-- `resume()`
-- `stop()`
-- `destroy()`
-- `seek(time)`
-- `setVolume(volume)`
-- `setPlaybackRate(rate)`
+## Public API
+
+Main methods:
+
+- `load(url, options?)`
+- `play(url?, options?)`
+- `pause()` / `resume()` / `stop()` / `destroy()`
+- `seek(seconds)` for MP4 and HLS VOD
+- `setVolume(0..1)`
 - `screenshot()`
 - `fullscreen()`
-- `getStats()`
-- `getState()`
-- `on(event, handler)`
-- `off(event, handler)`
+- `getState()` / `getStats()`
+- `on(event, listener)` / `off(event, listener)`
 
-## Current Support
+`setPlaybackRate()` currently reports an unsupported-operation log and does not
+change playback speed.
 
-- HTTP-FLV and WS-FLV: H.264 + AAC through Jessibuca WASM and Canvas/WebGL
-- HLS/m3u8 VOD and live: MPEG-TS H.264/AAC through WebCodecs/WebAudio; master playlists, AES-128, pause/resume and VOD seek are supported; SAMPLE-AES is not
-- MP4 VOD: ISO-BMFF demux to WebCodecs/WebAudio; H.264/H.265/AV1/VP9 video (subject to browser support), AAC audio, pause/resume and second-based seek
-- Every default path avoids `video` elements and MSE; `NoVideoGuard` checks this continuously during playback
-- WASM: Jessibuca-style fallback architecture is present, full bridge is TODO
-- H.265/G711: pending the WASM decoder bridge
-- h265web.js: study-only plus explicit experimental entry, not enabled by default; the npm package lacks the actual `dist/h265webjs.js`/wasm runtime asset
+See [docs/api.md](docs/api.md) for options, events, routing, and stats fields.
 
-MP4/HLS requires WebCodecs, WebAudio, Worker and Canvas/WebGL. Cross-origin media servers must allow CORS. MP4 uses concurrent Range chunks and assembles them in the worker before demux; progressive sample extraction while downloading remains future work.
+## Support matrix and limitations
 
-## Build
+- HTTP-FLV / WS-FLV: H.264 + AAC.
+- HLS: MPEG-TS H.264 + AAC. SAMPLE-AES, fMP4/CMAF, `EXT-X-MAP`, and byte-range
+  playlists are not implemented.
+- MP4: H.264/H.265/AV1/VP9 video subject to browser WebCodecs support; AAC audio
+  is currently required.
+- H.265 through h265web.js remains experimental because the vendored package does
+  not include the required browser runtime and WASM files.
+- Playback-rate control is not implemented.
 
-```bash
-npm install
-npm run build
-```
+## Documentation
 
-Build output is emitted to `dist/`.
+- [API reference](docs/api.md)
+- [Architecture](docs/architecture.md)
+- [Development guide](docs/development.md)
+- [Playback strategy](docs/playback-strategy.md)
+- [Jessibuca migration notes](docs/jessibuca-migration.md)
+- [H.265 integration study](docs/h265web-study.md)
+- [Chinese technical whitepaper](docs/technical-whitepaper-cn.md)
+- [Change log](CHANGELOG.md)
+
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for third-party software and
+licenses.

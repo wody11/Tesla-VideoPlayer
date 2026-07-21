@@ -2,7 +2,7 @@ import type { TeslaWorkerCommand, TeslaWorkerEvent } from './worker-protocol';
 import { parseM3U8, parseMaster, timeToSeq } from './hls/playlist';
 import { demuxTS, TSSample } from './ts/demux-ts';
 import { extractSpsPps } from './bsf/h264-annexb-avcc';
-import { demuxMp4, type Mp4DemuxSession } from './mp4/mp4box-demuxer';
+import { createMp4DemuxSession, type Mp4DemuxSession } from './mp4/mp4box-demuxer';
 import { decryptAes128CbcPkcs7, hexToBytes, seqToIv } from './hls/aes';
 import { isUsableMediaTimestamp } from './media-timestamp';
 
@@ -222,50 +222,93 @@ async function openMp4(url: string, startTime = 0): Promise<void> {
   mp4Session?.stop();
   mp4Session = null;
   aborter = new AbortController();
+  const session = createMp4DemuxSession(post, startTime);
+  mp4Session = session;
   try {
-    const buffer = await fetchMp4WithRanges(url);
-    post({ type: 'stream-open' });
-    mp4Session = demuxMp4(buffer, post, startTime);
+    await streamMp4Ranges(url, session, aborter.signal);
   } catch (error: any) {
+    session.stop();
     if (error?.name !== 'AbortError') post({ type: 'error', message: String(error?.message || error) });
   }
 }
 
-async function fetchMp4WithRanges(url: string): Promise<ArrayBuffer> {
+async function streamMp4Ranges(url: string, session: Mp4DemuxSession, signal: AbortSignal): Promise<void> {
   const chunkSize = 2 * 1024 * 1024;
   const first = await fetchMp4Range(url, 0, chunkSize - 1);
   if (!first.ok) throw new Error(`HTTP ${first.status} ${first.statusText}`);
-  const firstData = await first.arrayBuffer();
-  if (first.status === 200) return firstData;
+  post({ type: 'stream-open' });
 
-  const range = parseContentRange(first.headers.get('Content-Range'));
-  if (first.status !== 206 || !range) throw new Error('MP4 server returned an invalid partial response.');
-  const output = new Uint8Array(range.total);
-  output.set(new Uint8Array(firstData), range.start);
-  let nextOffset = range.end + 1;
-  let downloaded = firstData.byteLength;
-  post({ type: 'log', message: `MP4 Range download 0-${range.end}/${range.total}` });
+  // Some servers ignore Range. Feed the response stream incrementally instead of
+  // calling arrayBuffer(), which would duplicate the entire file in memory.
+  if (first.status === 200) {
+    await appendResponseStream(first, session, signal);
+    session.finish();
+    return;
+  }
 
-  const downloadWorker = async () => {
-    while (true) {
-      const offset = nextOffset;
-      if (offset >= range.total) return;
-      nextOffset += chunkSize;
-      const end = Math.min(range.total - 1, offset + chunkSize - 1);
-      const response = await fetchMp4Range(url, offset, end);
-      if (response.status !== 206) throw new Error(`MP4 Range ${offset}-${end} failed: HTTP ${response.status}.`);
-      const partRange = parseContentRange(response.headers.get('Content-Range'));
-      if (!partRange || partRange.start !== offset || partRange.total !== range.total) {
-        throw new Error(`MP4 server returned an unexpected Content-Range for offset ${offset}.`);
-      }
-      const part = new Uint8Array(await response.arrayBuffer());
-      output.set(part, offset);
-      downloaded += part.byteLength;
-      post({ type: 'log', message: `MP4 Range download ${Math.min(downloaded, range.total)}/${range.total}` });
+  const firstRange = parseContentRange(first.headers.get('Content-Range'));
+  if (first.status !== 206 || !firstRange || firstRange.start !== 0) {
+    throw new Error('MP4 server returned an invalid partial response.');
+  }
+
+  let loaded = 0;
+  let offset = 0;
+  let response: Response | undefined = first;
+  while (offset < firstRange.total && !signal.aborted) {
+    while (session.bufferedSamples() >= 768 && !signal.aborted) await sleep(20);
+    if (signal.aborted) throw abortError();
+
+    const expectedEnd = Math.min(firstRange.total - 1, offset + chunkSize - 1);
+    const current = response || await fetchMp4Range(url, offset, expectedEnd);
+    response = undefined;
+    if (current.status !== 206) throw new Error(`MP4 Range ${offset}-${expectedEnd} failed: HTTP ${current.status}.`);
+    const range = parseContentRange(current.headers.get('Content-Range'));
+    if (!range || range.start !== offset || range.total !== firstRange.total) {
+      throw new Error(`MP4 server returned an unexpected Content-Range for offset ${offset}.`);
     }
-  };
-  await Promise.all(Array.from({ length: 4 }, () => downloadWorker()));
-  return output.buffer;
+    const data = await current.arrayBuffer();
+    session.append(data, range.start, range.end + 1 >= range.total);
+    loaded += data.byteLength;
+    offset = range.end + 1;
+    post({ type: 'download-progress', loaded: Math.min(loaded, range.total), total: range.total });
+  }
+  if (signal.aborted) throw abortError();
+  session.finish();
+}
+
+async function appendResponseStream(response: Response, session: Mp4DemuxSession, signal: AbortSignal): Promise<void> {
+  if (!response.body) {
+    const data = await response.arrayBuffer();
+    session.append(data, 0, true);
+    post({ type: 'download-progress', loaded: data.byteLength, total: data.byteLength });
+    return;
+  }
+  const reader = response.body.getReader();
+  const totalHeader = Number(response.headers.get('Content-Length'));
+  const total = Number.isFinite(totalHeader) && totalHeader > 0 ? totalHeader : undefined;
+  let offset = 0;
+  while (!signal.aborted) {
+    while (session.bufferedSamples() >= 768 && !signal.aborted) await sleep(20);
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value?.byteLength) continue;
+    const data = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+    session.append(data, offset);
+    offset += value.byteLength;
+    post({ type: 'download-progress', loaded: offset, total });
+  }
+  if (signal.aborted) {
+    try { await reader.cancel(); } catch {}
+    throw abortError();
+  }
+}
+
+function abortError(): Error {
+  try { return new DOMException('Aborted', 'AbortError'); } catch {
+    const error = new Error('Aborted');
+    error.name = 'AbortError';
+    return error;
+  }
 }
 
 async function fetchMp4Range(url: string, start: number, end: number): Promise<Response> {
@@ -355,6 +398,11 @@ async function openHls(url: string, options: { liveStartSegmentCount?: number; l
       for (const segment of segments) {
         if (aborter?.signal.aborted) break;
         while (paused && !aborter?.signal.aborted) await sleep(30);
+        if (segment.discontinuity) {
+          videoConfigured = false;
+          audioConfigSignature = '';
+          post({ type: 'discontinuity', sequence: segment.seq });
+        }
         const response = await fetchWithRetry(segment.uri, 'HLS segment');
         let segmentData = await response.arrayBuffer();
         if (segment.key?.method === 'SAMPLE-AES') {

@@ -1,77 +1,128 @@
 # Tesla-VideoPlayer
 
-Tesla-VideoPlayer 是一个 no-video 播放器项目，现已参考 Jessibuca 开源版的成熟播放器架构重构，并整体按 GPL-3.0 发布。
+Tesla-VideoPlayer 是一个尽量把播放链路掌握在应用自身手里的浏览器播放器。
+Tesla WebCodecs 链路在 Worker 中完成拉流和解封装，在主线程用 WebCodecs 解码，
+再通过 Canvas/WebGL 和 WebAudio 输出。该链路不依赖 HTML `video` 标签，也不使用 MSE。
 
-## 来源与许可证
+项目同时内置 Jessibuca 运行时，用于 FLV 的 WASM 软件解码。
 
-本项目基于 Jessibuca 开源版架构改造：
+## 主要能力
 
-- Jessibuca 仓库：https://github.com/langhuihui/jessibuca
-- Jessibuca 许可证：GPL-3.0
-- 本项目许可证：GPL-3.0
-- 第三方说明：见 `THIRD_PARTY_NOTICES.md`
-- Jessibuca 运行产物已迁入：`vendor/jessibuca-runtime/`
-- Jessibuca 源码快照已迁入：`vendor/jessibuca-src/`
-- h265web.js 包快照已迁入：`vendor/h265webjs/`
+- HTTP-FLV 和 WebSocket-FLV。
+- HLS 点播/直播：MPEG-TS H.264/AAC、AES-128、主列表、点播 seek、
+  `EXT-X-DISCONTINUITY` 解码链路重置。
+- MP4 分块下载并增量送入 MP4Box 解封装，不再在 Worker 中复制整部文件。
+- WebCodecs 解码，Canvas2D/WebGL 渲染，WebAudio 输出。
+- session/generation 会话隔离，快速切换时旧 Worker 和旧 Decoder 回调不会污染新会话。
+- 压缩样本、Decoder、渲染和音频队列都有边界与背压控制。
+- FLV/HLS 使用统一自动重连策略。
+- 可选控制条、截图、全屏、运行统计，以及仅作用于播放器容器的 NoVideoGuard。
 
-## 播放目标
+## 播放路由
 
-默认播放链路不使用 HTML `video` 标签，不使用 MSE：
+| 媒体类型 | `decoderMode` | 实际链路 |
+|---|---|---|
+| HLS | `auto`、`webcodecs` | Worker 解封装 → WebCodecs → Canvas/WebGL → WebAudio |
+| MP4 | `auto`、`webcodecs` | 增量下载 → MP4Box → WebCodecs → Canvas/WebGL → WebAudio |
+| HTTP/WS FLV | `auto`、`wasm` | Jessibuca WASM → Canvas/WebGL → WebAudio |
+| HTTP/WS FLV | `webcodecs` | Worker FLV 解封装 → WebCodecs → Canvas/WebGL → WebAudio |
+| 实验性 H.265 | 显式启用 | 依赖外部补齐 h265web.js 运行文件和 WASM 资产 |
 
-`MP4 / HLS / HTTP-FLV / WS-FLV -> Worker 拉流与解封装 -> WebCodecs 或 WASM -> Canvas/WebGL -> WebAudio`
+HLS/MP4 不支持 `decoderMode: "wasm"`，因为目前还没有完成适用于这些容器的
+类型化软件解码桥接。
 
-如果能力未接通，代码会显示明确错误或 TODO，不会静默退回 video 标签。
+## 运行要求
 
-## 新入口
+WebCodecs 链路要求浏览器支持：
+
+- `VideoDecoder`、`AudioDecoder`；
+- Worker、WebAudio、Canvas2D 或 WebGL；
+- 媒体服务器允许跨域访问；
+- MP4 服务端最好支持 Range 请求。
+
+请通过 HTTP(S) 访问构建产物，不建议直接使用 `file://` 打开。
+
+## 安装、测试和构建
+
+```bash
+npm ci
+npm test
+npm run typecheck
+npm run build
+```
+
+主要构建产物：
+
+- `dist/index.js`：播放器公开 API；
+- `dist/worker-entry.js`：唯一有效的 Tesla Worker 入口；
+- Jessibuca 运行资产会复制到 `dist/`。
+
+## 快速使用
 
 ```ts
 import { createTeslaPlayer } from './dist/index.js';
 
-const player = createTeslaPlayer(document.querySelector('#player')!, {
+const container = document.querySelector<HTMLElement>('#player');
+if (!container) throw new Error('找不到播放器容器');
+
+const player = createTeslaPlayer(container, {
   decoderMode: 'auto',
   renderer: 'webgl',
-  controls: true
+  fitMode: 'contain',
+  controls: true,
+  autoplay: false,
+  preset: 'balanced',
+  volume: 0.8,
+  reconnect: true,
+  reconnectMaxRetries: 3,
+  reconnectDelayMs: 1000
 });
 
-player.load('https://example.com/live.flv');
+player.on('state', state => console.log('状态', state));
+player.on('error', error => console.error(error));
+player.on('reconnect', attempt => console.log('第几次重连', attempt));
+
+player.load('https://example.com/live.m3u8', { sourceType: 'hls' });
 await player.play();
 ```
 
-## API
+对于没有扩展名、带签名参数或接口转发的 URL，建议明确填写 `sourceType`。
+否则普通 HTTP(S) URL 默认会被识别为 HTTP-FLV。
 
-- `load(url, options)`
-- `play()`
-- `pause()`
-- `resume()`
-- `stop()`
-- `destroy()`
-- `seek(time)`
-- `setVolume(volume)`
-- `setPlaybackRate(rate)`
+## 公开 API
+
+主要方法：
+
+- `load(url, options?)`
+- `play(url?, options?)`
+- `pause()` / `resume()` / `stop()` / `destroy()`
+- `seek(seconds)`：仅 MP4 和 HLS 点播
+- `setVolume(0..1)`
 - `screenshot()`
 - `fullscreen()`
-- `getStats()`
-- `getState()`
-- `on(event, handler)`
-- `off(event, handler)`
+- `getState()` / `getStats()`
+- `on(event, listener)` / `off(event, listener)`
 
-## 支持状态
+`setPlaybackRate()` 目前只会输出“不支持”的日志，不会真的修改播放速度。
 
-- HTTP-FLV、WS-FLV：H.264 + AAC，Jessibuca WASM 解码后渲染到 Canvas/WebGL
-- HLS/m3u8 点播与直播：MPEG-TS H.264/AAC -> WebCodecs/WebAudio，支持主列表、AES-128、暂停/续播和点播 seek；SAMPLE-AES 暂不支持
-- MP4 点播：ISO-BMFF 解封装 -> WebCodecs/WebAudio，支持 H.264/H.265/AV1/VP9 视频（以浏览器 WebCodecs 能力为准）、AAC 音频、暂停/续播和按秒 seek
-- 全部默认链路均不创建 `video` 标签，不使用 MSE；播放时 `NoVideoGuard` 会持续检查
-- WASM：已保留 Jessibuca 式 fallback 架构和 TODO，完整 bridge 尚未接通
-- H.265/G711：等待 WASM bridge 完成后接入
-- h265web.js：只做研究和显式实验入口，不默认启用；npm 包缺少实际 `dist/h265webjs.js`/wasm 运行资产，补齐后才可测试
+完整配置、事件和 Stats 字段请看 [docs/api.md](docs/api.md)。
 
-浏览器要求：MP4/HLS 主链路需要 WebCodecs、WebAudio、Worker 与 Canvas/WebGL。跨域媒体地址必须由服务端返回允许 CORS 的响应头。MP4 使用并发 Range 分块下载并在 Worker 中组装后解封装；边下边播的渐进式 sample 提取仍待优化。
+## 当前限制
 
-## 构建
+- HTTP-FLV / WS-FLV：H.264 + AAC。
+- HLS：MPEG-TS H.264 + AAC；暂不支持 SAMPLE-AES、fMP4/CMAF、
+  `EXT-X-MAP` 和 BYTERANGE 列表。
+- MP4：视频支持范围取决于浏览器 WebCodecs，当前音频要求 AAC。
+- h265web.js 仍为实验性功能，因为当前 vendored 包缺少完整浏览器运行文件和 WASM。
+- 暂不支持播放倍速。
 
-```bash
-npm install
-npm run build
-```
+## 文档索引
 
-构建产物位于 `dist/`，包括 `dist/index.js` 与 worker 入口。
+- [API 说明](docs/api.md)
+- [架构说明](docs/architecture.md)
+- [开发指南](docs/development.md)
+- [播放策略](docs/playback-strategy.md)
+- [Jessibuca 迁移说明](docs/jessibuca-migration.md)
+- [H.265 集成研究](docs/h265web-study.md)
+- [中文技术白皮书](docs/technical-whitepaper-cn.md)
+- [变更记录](CHANGELOG.md)

@@ -9,7 +9,8 @@
     "build:demo": "rollup -c rollup.demo.config.js",
     "build": "npm run build:worker",
     "test": "jest --config jest.config.js --runInBand",
-    "lint": "echo 'lint placeholder'"
+    "typecheck": "tsc --noEmit",
+    "lint": "npm run typecheck"
   },
   "devDependencies": {
     "@rollup/plugin-commonjs": "^25.0.0",

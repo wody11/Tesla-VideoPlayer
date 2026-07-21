@@ -10,8 +10,11 @@ export interface TeslaPlayerStats {
   decoderType: 'webcodecs' | 'wasm' | 'unsupported' | 'none';
   rendererType: 'canvas2d' | 'webgl' | 'none';
   audioType: 'webaudio' | 'none';
+  /** Compressed video samples/tags observed by the active media pipeline. */
   videoTagCount: number;
   audioSampleCount: number;
+  /** DOM diagnostics scoped to this player's container. */
+  videoElementCount: number;
   canvasCount: number;
   fps: number;
   decodedFrames: number;
@@ -28,17 +31,21 @@ export interface TeslaPlayerStats {
   firstFrameTimeMs: number;
   bitrate: number;
   reconnectCount: number;
+  discontinuityCount: number;
+  downloadedBytes: number;
+  totalBytes: number;
   lastError: string;
 }
 
-export class PlayerStatsTracker {
-  private stats: TeslaPlayerStats = {
+function createInitialStats(): TeslaPlayerStats {
+  return {
     sourceType: 'unknown',
     decoderType: 'none',
     rendererType: 'none',
     audioType: 'none',
     videoTagCount: 0,
     audioSampleCount: 0,
+    videoElementCount: 0,
     canvasCount: 0,
     fps: 0,
     decodedFrames: 0,
@@ -55,14 +62,40 @@ export class PlayerStatsTracker {
     firstFrameTimeMs: 0,
     bitrate: 0,
     reconnectCount: 0,
+    discontinuityCount: 0,
+    downloadedBytes: 0,
+    totalBytes: 0,
     lastError: ''
   };
+}
 
+export class PlayerStatsTracker {
+  private stats = createInitialStats();
   private frameTicks = 0;
-  private lastFpsAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
+  private lastFpsAt = now();
+
+  constructor(private scope?: Pick<ParentNode, 'querySelectorAll'>) {}
+
+  setScope(scope?: Pick<ParentNode, 'querySelectorAll'>): void {
+    this.scope = scope;
+  }
+
+  resetSession(values: Partial<TeslaPlayerStats> = {}): void {
+    this.stats = { ...createInitialStats(), ...values };
+    this.frameTicks = 0;
+    this.lastFpsAt = now();
+  }
 
   patch(values: Partial<TeslaPlayerStats>): void {
     this.stats = { ...this.stats, ...values };
+  }
+
+  incrementReconnect(): void {
+    this.stats.reconnectCount += 1;
+  }
+
+  markDiscontinuity(): void {
+    this.stats.discontinuityCount += 1;
   }
 
   markDecoded(): void {
@@ -75,21 +108,24 @@ export class PlayerStatsTracker {
 
   markRendered(): void {
     this.frameTicks += 1;
-    const now = performance.now();
-    if (now - this.lastFpsAt >= 1000) {
-      this.stats.fps = this.frameTicks;
+    const current = now();
+    const elapsed = current - this.lastFpsAt;
+    if (elapsed >= 1000) {
+      this.stats.fps = Math.round((this.frameTicks * 1000) / elapsed);
       this.frameTicks = 0;
-      this.lastFpsAt = now;
+      this.lastFpsAt = current;
     }
   }
 
   snapshot(): TeslaPlayerStats {
-    if (typeof document !== 'undefined') {
-      this.patch({
-        videoTagCount: document.querySelectorAll('video').length,
-        canvasCount: document.querySelectorAll('canvas').length
-      });
+    if (this.scope) {
+      this.stats.videoElementCount = this.scope.querySelectorAll('video').length;
+      this.stats.canvasCount = this.scope.querySelectorAll('canvas').length;
     }
     return { ...this.stats };
   }
+}
+
+function now(): number {
+  return typeof performance !== 'undefined' ? performance.now() : Date.now();
 }

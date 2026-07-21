@@ -1,60 +1,73 @@
-# Tesla playback strategy
+# Playback Strategy
 
-This document captures the Jessibuca-style ideas that Tesla-VideoPlayer should
-keep as first-class playback policy, not ad-hoc fixes.
+Playback policy is explicit and testable rather than scattered across ad-hoc
+timeouts.
 
-## Strategy model
+## Presets
 
-Use three explicit presets:
+| Preset | Goal | Audio target | Decode batch | Render queue | Late drop |
+|---|---|---:|---:|---:|---:|
+| `low-latency` | minimum live delay | 900 ms | 10 | 80 | 160 ms |
+| `balanced` | default compromise | 1500 ms | 8 | 120 | 240 ms |
+| `smooth` | tolerate jitter | 2600 ms | 6 | 180 | 420 ms |
 
-- `low-latency`: smallest live delay, more willing to drop late video.
-- `balanced`: default for live HLS/FLV, moderate audio buffer and bounded video
-  queue.
-- `smooth`: larger audio/render buffer, less aggressive dropping, useful when
-  network jitter is visible.
+Explicit advanced options override or update these values.
 
-## Pipeline rules
+## Compressed-sample rules
 
-- Preserve demux output order for compressed video. Do not globally sort H.264
-  samples by PTS before decode; B frames need decoder input order to remain
-  valid.
-- Sort only decoded render frames, because `VideoFrame.timestamp` is presentation
-  time.
-- Configure decoders as soon as codec data is available. Queue samples until
-  configure completes.
-- Keep SPS/PPS with keyframes in TS demux output.
+- Preserve demux/decode input order. Do not sort compressed H.264 samples by PTS;
+  B-frame streams need decode order.
+- Do not submit delta frames before the first keyframe.
+- For live queue overload, discard old compressed video and restart from the
+  newest retained keyframe.
+- Preserve timestamp zero. `tsUs === 0` is valid media time.
 
-## Buffer rules
+## Decoder rules
 
-- HLS live starts from the newest segment by default, matching low-delay player
-  behavior.
-- Fetch one live segment per poll by default. Increasing this improves smoothness
-  but adds delay.
-- Decode video in small batches per animation frame so one TS segment does not
-  stall the main thread.
-- Maintain a bounded render queue. Drop only frames that are too late or when the
-  queue grows beyond the configured cap.
+- Configure as soon as codec data is available.
+- Queue samples while asynchronous `isConfigSupported/configure` work completes.
+- Reject stale configuration completions by generation ID.
+- Gate video submission using `VideoDecoder.decodeQueueSize`.
+- Gate audio submission using both `AudioDecoder.decodeQueueSize` and scheduled
+  WebAudio duration.
+- Decode in short batches so a segment cannot monopolize the main thread.
 
-## Audio rules
+## Render and A/V sync rules
 
-- Do not drop normal audio frames just because the queue is above target; this
-  creates audible gaps.
-- Schedule audio continuously with WebAudio.
-- If audio queue is higher than target, use a tiny playback-rate catch-up.
-- If audio queue becomes extreme, reset the scheduled sources rather than
-  letting live delay grow forever.
+- Sort decoded `VideoFrame` objects by presentation timestamp.
+- Use scheduled audio time as the primary clock.
+- Use a wall-clock base only while audio is unavailable.
+- Wait for early frames, draw due frames, and close frames that exceed the late
+  threshold.
+- Cap the render queue and close every evicted frame.
+
+## HLS live rules
+
+- Start near the newest available segment.
+- Fetch a small segment batch per poll.
+- Treat discontinuity as a new decode epoch: reset decoders, queues, clocks, and
+  keyframe/config gating.
+- Retry transient playlist or segment failures before escalating.
+
+## MP4 rules
+
+- Append network chunks directly to MP4Box; never build a second whole-file copy.
+- Respect main-thread sample credit and Worker high-water marks.
+- Release used MP4Box samples after transferring their data.
+- A seek starts a fresh playback session so old samples and decoder callbacks
+  cannot leak across the seek boundary.
 
 ## Error and retry rules
 
-- Playlist/segment fetch failures should retry with short backoff before
-  surfacing an error.
-- Unsupported codec/encryption should fail explicitly.
-- WebCodecs unsupported should fail explicitly; WASM fallback is TODO until
-  Tesla owns a decoder implementation.
+- Unsupported codec, encryption, source route, and browser capability failures
+  must be explicit.
+- Fatal engine errors terminate the active generation before emitting `error`.
+- The outer player owns retry policy for HTTP-FLV, WS-FLV, and HLS.
+- MP4 is not automatically retried because a partial VOD failure should be
+  surfaced deterministically rather than silently restarting from the beginning.
 
 ## UI rules
 
-- The stage must fit in the viewport; settings panels scroll independently.
-- Expose strategy presets plus advanced knobs so tuning is visible and
-  repeatable.
-- Keep `video` element count at zero during playback.
+- Controls are optional and scoped to the player container.
+- NoVideoGuard observes only that container.
+- A `video` element elsewhere on the page must not break playback.

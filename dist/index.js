@@ -1,5 +1,4 @@
-export { decodePesTimestamp, demuxTS } from './demux-ts-8c9ae7ff.js';
-import './aac-adts-raw-dd9b33fc.js';
+export { d as decodePesTimestamp, a as demuxTS } from './demux-ts-6eb45a7f.js';
 
 /*
  * Tesla-VideoPlayer is based on Jessibuca open source architecture.
@@ -64,38 +63,60 @@ class PlayerStateMachine {
  * Tesla-VideoPlayer is based on Jessibuca open source architecture.
  * Jessibuca is licensed under GPL-3.0. See THIRD_PARTY_NOTICES.md.
  */
+function createInitialStats() {
+    return {
+        sourceType: 'unknown',
+        decoderType: 'none',
+        rendererType: 'none',
+        audioType: 'none',
+        videoTagCount: 0,
+        audioSampleCount: 0,
+        videoElementCount: 0,
+        canvasCount: 0,
+        fps: 0,
+        decodedFrames: 0,
+        droppedFrames: 0,
+        audioQueueMs: 0,
+        audioDecodedFrames: 0,
+        audioScheduledSources: 0,
+        audioFrameSamples: 0,
+        audioContextState: 'closed',
+        videoQueueLength: 0,
+        currentTime: 0,
+        currentTimeMs: 0,
+        duration: 0,
+        firstFrameTimeMs: 0,
+        bitrate: 0,
+        reconnectCount: 0,
+        discontinuityCount: 0,
+        downloadedBytes: 0,
+        totalBytes: 0,
+        lastError: ''
+    };
+}
 class PlayerStatsTracker {
-    constructor() {
-        this.stats = {
-            sourceType: 'unknown',
-            decoderType: 'none',
-            rendererType: 'none',
-            audioType: 'none',
-            videoTagCount: 0,
-            audioSampleCount: 0,
-            canvasCount: 0,
-            fps: 0,
-            decodedFrames: 0,
-            droppedFrames: 0,
-            audioQueueMs: 0,
-            audioDecodedFrames: 0,
-            audioScheduledSources: 0,
-            audioFrameSamples: 0,
-            audioContextState: 'closed',
-            videoQueueLength: 0,
-            currentTime: 0,
-            currentTimeMs: 0,
-            duration: 0,
-            firstFrameTimeMs: 0,
-            bitrate: 0,
-            reconnectCount: 0,
-            lastError: ''
-        };
+    constructor(scope) {
+        this.scope = scope;
+        this.stats = createInitialStats();
         this.frameTicks = 0;
-        this.lastFpsAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        this.lastFpsAt = now();
+    }
+    setScope(scope) {
+        this.scope = scope;
+    }
+    resetSession(values = {}) {
+        this.stats = { ...createInitialStats(), ...values };
+        this.frameTicks = 0;
+        this.lastFpsAt = now();
     }
     patch(values) {
         this.stats = { ...this.stats, ...values };
+    }
+    incrementReconnect() {
+        this.stats.reconnectCount += 1;
+    }
+    markDiscontinuity() {
+        this.stats.discontinuityCount += 1;
     }
     markDecoded() {
         this.stats.decodedFrames += 1;
@@ -105,28 +126,54 @@ class PlayerStatsTracker {
     }
     markRendered() {
         this.frameTicks += 1;
-        const now = performance.now();
-        if (now - this.lastFpsAt >= 1000) {
-            this.stats.fps = this.frameTicks;
+        const current = now();
+        const elapsed = current - this.lastFpsAt;
+        if (elapsed >= 1000) {
+            this.stats.fps = Math.round((this.frameTicks * 1000) / elapsed);
             this.frameTicks = 0;
-            this.lastFpsAt = now;
+            this.lastFpsAt = current;
         }
     }
     snapshot() {
-        if (typeof document !== 'undefined') {
-            this.patch({
-                videoTagCount: document.querySelectorAll('video').length,
-                canvasCount: document.querySelectorAll('canvas').length
-            });
+        if (this.scope) {
+            this.stats.videoElementCount = this.scope.querySelectorAll('video').length;
+            this.stats.canvasCount = this.scope.querySelectorAll('canvas').length;
         }
         return { ...this.stats };
     }
+}
+function now() {
+    return typeof performance !== 'undefined' ? performance.now() : Date.now();
 }
 
 /*
  * Tesla-VideoPlayer is based on Jessibuca open source architecture.
  * Jessibuca is licensed under GPL-3.0. See THIRD_PARTY_NOTICES.md.
  */
+const DEFAULT_PLAYER_OPTIONS = {
+    decoderMode: 'auto',
+    renderer: 'webgl',
+    fitMode: 'contain',
+    controls: false,
+    autoplay: false,
+    preset: 'balanced',
+    volume: 1,
+    reconnect: true,
+    reconnectMaxRetries: 3,
+    reconnectDelayMs: 1000
+};
+function normalizePlayerOptions(options) {
+    return {
+        ...DEFAULT_PLAYER_OPTIONS,
+        ...options,
+        volume: clamp(Number(options.volume ?? DEFAULT_PLAYER_OPTIONS.volume), 0, 1),
+        reconnectMaxRetries: Math.max(0, Math.floor(Number(options.reconnectMaxRetries ?? DEFAULT_PLAYER_OPTIONS.reconnectMaxRetries))),
+        reconnectDelayMs: Math.max(100, Math.floor(Number(options.reconnectDelayMs ?? DEFAULT_PLAYER_OPTIONS.reconnectDelayMs)))
+    };
+}
+function clamp(value, min, max) {
+    return Number.isFinite(value) ? Math.max(min, Math.min(max, value)) : min;
+}
 function inferSourceType(url) {
     if (/^wss?:\/\//i.test(url) && /\.flv(\?|$)/i.test(url))
         return 'ws-flv';
@@ -143,20 +190,20 @@ function inferSourceType(url) {
  * Tesla-VideoPlayer is based on Jessibuca open source architecture.
  * Jessibuca is licensed under GPL-3.0. See THIRD_PARTY_NOTICES.md.
  */
-function assertNoVideoElements() {
-    return document.querySelectorAll('video').length;
+function assertNoVideoElements(root = document) {
+    return root.querySelectorAll('video').length;
 }
 class NoVideoGuard {
-    start(onViolation) {
+    start(onViolation, root = document) {
         this.stop();
         const check = () => {
-            const count = assertNoVideoElements();
+            const count = assertNoVideoElements(root);
             if (count > 0)
                 onViolation(count);
         };
         check();
         this.observer = new MutationObserver(check);
-        this.observer.observe(document.documentElement, { childList: true, subtree: true });
+        this.observer.observe(root, { childList: true, subtree: true });
     }
     stop() {
         this.observer?.disconnect();
@@ -289,9 +336,16 @@ class WebAudioPlayer {
             lastTimestampUs: this.lastTimestampUs
         };
     }
-    close() {
+    reset() {
         this.stopScheduledSources();
         this.clock.reset();
+        this.scheduledUntil = this.context.currentTime;
+        this.enqueuedFrames = 0;
+        this.lastFrameSamples = 0;
+        this.lastTimestampUs = 0;
+    }
+    close() {
+        this.reset();
         this.context.close().catch(() => undefined);
     }
     stopScheduledSources() {
@@ -568,7 +622,7 @@ function detectCapability(canvas, requireWebCodecs = true) {
         webGL = false;
     }
     const supported = webAudio && (!requireWebCodecs || (webCodecsVideo && webCodecsAudio));
-    const reason = supported ? undefined : 'This no-video path requires WebAudio and WebCodecs, or an enabled WASM decoder fallback.';
+    const reason = supported ? undefined : 'This playback route requires WebAudio and WebCodecs. Select the Jessibuca engine for supported FLV/WASM playback.';
     return { webCodecsVideo, webCodecsAudio, webAudio, webGL, wasm, supported, reason };
 }
 
@@ -602,17 +656,78 @@ const PLAYBACK_PRESETS = {
     }
 };
 
+/**
+ * Tracks one active asynchronous playback session.
+ *
+ * Starting or invalidating a session makes every previously issued token stale,
+ * so late Worker/WebCodecs callbacks can be ignored safely.
+ */
+class SessionGeneration {
+    constructor() {
+        this.generation = 0;
+        this.active = false;
+    }
+    begin() {
+        this.generation += 1;
+        this.active = true;
+        return this.generation;
+    }
+    invalidate() {
+        this.generation += 1;
+        this.active = false;
+    }
+    isCurrent(sessionId) {
+        return this.active && sessionId === this.generation;
+    }
+    get current() {
+        return this.generation;
+    }
+}
+
+const DEFAULT_VIDEO_DECODE_QUEUE_LIMIT = 24;
+function canDecodeVideo(configured, pendingSamples, renderQueueSize, decoderQueueSize, maxRenderQueue, decoderQueueLimit = DEFAULT_VIDEO_DECODE_QUEUE_LIMIT) {
+    return configured
+        && pendingSamples > 0
+        && renderQueueSize < maxRenderQueue
+        && decoderQueueSize < decoderQueueLimit;
+}
+/**
+ * Bounds a live-video sample queue without resuming from an undecodable delta frame.
+ * The newest key frame is retained with all samples after it. If there is no key
+ * frame in the retained window, the queue is cleared and playback waits for one.
+ */
+function trimLiveVideoQueue(queue, maxSize) {
+    const limit = Math.max(1, Math.floor(maxSize));
+    if (queue.length <= limit)
+        return 0;
+    const searchStart = Math.max(0, queue.length - limit);
+    let keepFrom = -1;
+    for (let i = queue.length - 1; i >= searchStart; i -= 1) {
+        if (queue[i].key) {
+            keepFrom = i;
+            break;
+        }
+    }
+    if (keepFrom < 0) {
+        const dropped = queue.length;
+        queue.length = 0;
+        return dropped;
+    }
+    const dropped = keepFrom;
+    queue.splice(0, keepFrom);
+    return dropped;
+}
+
 class HlsWebCodecsEngine {
     constructor(options) {
         this.options = options;
         this.events = new PlayerEvents();
         this.state = new PlayerStateMachine();
-        this.stats = new PlayerStatsTracker();
-        this.guard = new NoVideoGuard();
+        this.sessions = new SessionGeneration();
         this.firstFrameStart = 0;
         this.firstFrameSeen = false;
         this.videoQueueLength = 0;
-        this.stopped = false;
+        this.stopped = true;
         this.paused = false;
         this.pausedAtMs = 0;
         this.sourceType = 'hls';
@@ -635,6 +750,7 @@ class HlsWebCodecsEngine {
             lateDropMs: 240
         };
         this.on = this.events.on.bind(this.events);
+        this.stats = new PlayerStatsTracker(options.container);
         this.canvas = document.createElement('canvas');
         this.canvas.style.width = '100%';
         this.canvas.style.height = '100%';
@@ -650,17 +766,24 @@ class HlsWebCodecsEngine {
         this.renderer = this.createRenderer(options.renderer || 'webgl');
         this.stats.patch({ rendererType: this.renderer.type });
         this.stats.patch({ sourceType: 'hls', audioType: 'webaudio' });
-        this.guard.start(count => this.fail(new Error(`video elements are forbidden, found ${count}.`)));
     }
     async play(url, sourceType = 'hls', startTime = 0) {
         if (!url)
             throw new Error('Playback URL is required.');
-        this.stop();
+        // Make every callback from the previous playback stale before releasing it.
+        const sessionId = this.sessions.begin();
+        this.releasePlaybackResources();
         this.stopped = false;
         this.paused = false;
         this.sourceType = sourceType;
         this.currentUrl = url;
         this.mp4PullOutstanding = 0;
+        this.stats.resetSession({
+            sourceType,
+            decoderType: 'webcodecs',
+            rendererType: this.renderer.type,
+            audioType: 'webaudio'
+        });
         this.firstFrameStart = performance.now();
         this.firstFrameSeen = false;
         this.state.transition('loading');
@@ -668,33 +791,43 @@ class HlsWebCodecsEngine {
         const capability = detectCapability(this.canvas);
         if (!capability.supported) {
             this.stats.patch({ decoderType: 'unsupported' });
-            throw new Error(capability.reason || 'Required browser capability is not available.');
+            const error = new Error(capability.reason || 'Required browser capability is not available.');
+            this.fail(error, sessionId);
+            throw error;
         }
-        this.audio = new WebAudioPlayer();
-        this.audio.setMaxQueueMs(this.settings.audioMaxQueueMs);
-        this.audio.resume().catch(error => {
-            this.events.emit('log', `AudioContext resume is pending or blocked: ${error?.message || error}`);
-        });
-        this.decoder = new WebCodecsDecoder({
-            onVideoFrame: frame => this.handleVideoFrame(frame),
-            onAudioFrame: frame => this.handleAudioFrame(frame),
-            onError: error => this.fail(error)
-        });
-        this.stats.patch({ decoderType: 'webcodecs' });
-        this.worker = new Worker(this.options.workerUrl || new URL('./worker-entry.js', import.meta.url), { type: 'module' });
-        this.worker.onmessage = event => this.handleWorkerEvent(event.data);
-        this.worker.onerror = event => this.fail(new Error(event.message || 'HTTP-FLV worker failed.'));
-        if (sourceType === 'mp4')
-            this.worker.postMessage({ type: 'open-mp4', url, startTime });
-        else if (sourceType === 'hls')
-            this.worker.postMessage({
-                type: 'open-hls', url,
-                liveStartSegmentCount: this.settings.liveStartSegmentCount,
-                liveSegmentBatch: this.settings.liveSegmentBatch,
-                startTime
+        try {
+            const audio = new WebAudioPlayer();
+            this.audio = audio;
+            audio.setMaxQueueMs(this.settings.audioMaxQueueMs);
+            audio.resume().catch(error => {
+                if (this.sessions.isCurrent(sessionId)) {
+                    this.events.emit('log', `AudioContext resume is pending or blocked: ${error?.message || error}`);
+                }
             });
-        else
-            this.worker.postMessage({ type: sourceType === 'ws-flv' ? 'open-ws-flv' : 'open-http-flv', url });
+            const decoder = this.createDecoder(sessionId);
+            this.decoder = decoder;
+            this.stats.patch({ decoderType: 'webcodecs' });
+            const worker = new Worker(this.options.workerUrl || new URL('./worker-entry.js', import.meta.url), { type: 'module' });
+            this.worker = worker;
+            worker.onmessage = event => this.handleWorkerEvent(event.data, sessionId);
+            worker.onerror = event => this.fail(new Error(event.message || 'Playback worker failed.'), sessionId);
+            if (sourceType === 'mp4')
+                worker.postMessage({ type: 'open-mp4', url, startTime });
+            else if (sourceType === 'hls')
+                worker.postMessage({
+                    type: 'open-hls', url,
+                    liveStartSegmentCount: this.settings.liveStartSegmentCount,
+                    liveSegmentBatch: this.settings.liveSegmentBatch,
+                    startTime
+                });
+            else
+                worker.postMessage({ type: sourceType === 'ws-flv' ? 'open-ws-flv' : 'open-http-flv', url });
+        }
+        catch (error) {
+            const normalized = error instanceof Error ? error : new Error(String(error));
+            this.fail(normalized, sessionId);
+            throw normalized;
+        }
     }
     pause() {
         if (this.paused || this.stopped)
@@ -709,18 +842,21 @@ class HlsWebCodecsEngine {
     async resume() {
         if (!this.paused || this.stopped)
             return;
+        const sessionId = this.sessions.current;
         const pausedDuration = performance.now() - this.pausedAtMs;
         if (this.videoWallClockBaseMs !== undefined)
             this.videoWallClockBaseMs += pausedDuration;
-        this.paused = false;
         await this.audio?.resume();
+        if (!this.sessions.isCurrent(sessionId))
+            return;
+        this.paused = false;
         this.worker?.postMessage({ type: 'resume' });
         this.state.transition('playing');
         this.events.emit('state', this.state.current);
         if (this.pendingVideoSamples.length || this.pendingAudioSamples.length)
-            this.ensureDecodePump();
+            this.ensureDecodePump(sessionId);
         if (this.renderQueue.length)
-            this.ensureRenderLoop();
+            this.ensureRenderLoop(sessionId);
     }
     async seek(time) {
         if (this.sourceType !== 'mp4' && this.sourceType !== 'hls')
@@ -730,36 +866,14 @@ class HlsWebCodecsEngine {
         await this.play(this.currentUrl, this.sourceType, Math.max(0, Number(time) || 0));
     }
     stop() {
-        this.stopped = true;
-        this.paused = false;
-        this.worker?.postMessage({ type: 'stop' });
-        this.worker?.terminate();
-        this.worker = undefined;
-        this.decoder?.close();
-        this.decoder = undefined;
-        this.audio?.close();
-        this.audio = undefined;
-        this.videoQueueLength = 0;
-        this.videoConfigured = false;
-        this.audioConfigured = false;
-        this.seenKeyFrame = false;
-        this.pendingVideoSamples = [];
-        this.pendingAudioSamples = [];
-        this.mp4PullOutstanding = 0;
-        this.videoWallClockBaseUs = undefined;
-        this.videoWallClockBaseMs = undefined;
-        this.clearDecodePump();
-        this.clearRenderQueue();
-        try {
-            this.renderer.clear();
-        }
-        catch { }
+        this.sessions.invalidate();
+        this.releasePlaybackResources();
         this.state.transition('stopped');
         this.events.emit('state', this.state.current);
     }
     destroy() {
-        this.stop();
-        this.guard.stop();
+        this.sessions.invalidate();
+        this.releasePlaybackResources();
         this.events.clear();
         this.renderer.destroy();
         this.canvas.remove();
@@ -777,16 +891,20 @@ class HlsWebCodecsEngine {
             audioFrameSamples: audioDiagnostics?.lastFrameSamples || 0,
             audioContextState: audioDiagnostics?.contextState || 'closed',
             videoQueueLength: this.videoQueueLength,
-            currentTimeMs: this.audio?.currentTimeMs() || 0
+            currentTimeMs: this.audio?.currentTimeMs() || 0,
+            currentTime: (this.audio?.currentTimeMs() || 0) / 1000
         });
         return this.stats.snapshot();
     }
     setRenderer(type) {
+        if (this.renderer.type === type)
+            return;
         this.renderer.destroy();
         this.renderer = this.createRenderer(type);
         this.stats.patch({ rendererType: this.renderer.type });
     }
     updateSettings(values) {
+        this.options = { ...this.options, ...values };
         if (values.preset) {
             const preset = PLAYBACK_PRESETS[values.preset];
             if (preset) {
@@ -823,8 +941,34 @@ class HlsWebCodecsEngine {
             return new CanvasRenderer(this.canvas);
         }
     }
-    handleWorkerEvent(message) {
-        if (this.stopped)
+    createDecoder(sessionId) {
+        return new WebCodecsDecoder({
+            onVideoFrame: frame => this.handleVideoFrame(frame, sessionId),
+            onAudioFrame: frame => this.handleAudioFrame(frame, sessionId),
+            onError: error => this.fail(error, sessionId)
+        });
+    }
+    resetForDiscontinuity(sessionId, sequence) {
+        if (!this.sessions.isCurrent(sessionId))
+            return;
+        this.decoder?.close();
+        this.decoder = this.createDecoder(sessionId);
+        this.audio?.reset();
+        this.videoConfigured = false;
+        this.audioConfigured = false;
+        this.seenKeyFrame = false;
+        this.pendingVideoSamples = [];
+        this.pendingAudioSamples = [];
+        this.videoQueueLength = 0;
+        this.videoWallClockBaseUs = undefined;
+        this.videoWallClockBaseMs = undefined;
+        this.clearDecodePump();
+        this.clearRenderQueue();
+        this.stats.markDiscontinuity();
+        this.events.emit('log', `HLS discontinuity at media sequence ${sequence}; decoder and AV clocks reset.`);
+    }
+    handleWorkerEvent(message, sessionId) {
+        if (!this.sessions.isCurrent(sessionId) || this.stopped)
             return;
         try {
             if (message.type === 'stream-open') {
@@ -833,6 +977,12 @@ class HlsWebCodecsEngine {
             else if (message.type === 'stream-end') {
                 this.events.emit('log', 'Stream ended.');
             }
+            else if (message.type === 'discontinuity') {
+                this.resetForDiscontinuity(sessionId, message.sequence);
+            }
+            else if (message.type === 'download-progress') {
+                this.stats.patch({ downloadedBytes: message.loaded, totalBytes: message.total || 0 });
+            }
             else if (message.type === 'media-info') {
                 this.stats.patch({ duration: message.duration });
                 this.events.emit('log', `Media info: ${message.videoCodec || 'no video'} / ${message.audioCodec || 'no audio'}, ${message.duration.toFixed(2)}s.`);
@@ -840,18 +990,24 @@ class HlsWebCodecsEngine {
             }
             else if (message.type === 'video-config') {
                 this.events.emit('log', `Video config received: ${message.codec}${message.annexb ? ' annexb' : ''}`);
-                this.decoder?.configureVideo(message).then(() => {
+                const decoder = this.decoder;
+                decoder?.configureVideo(message).then(() => {
+                    if (!this.sessions.isCurrent(sessionId) || decoder !== this.decoder)
+                        return;
                     this.videoConfigured = true;
                     this.events.emit('log', `VideoDecoder configured, queued video samples: ${this.pendingVideoSamples.length}.`);
-                    this.ensureDecodePump();
-                }).catch(error => this.fail(error));
+                    this.ensureDecodePump(sessionId);
+                }).catch(error => this.fail(error, sessionId));
             }
             else if (message.type === 'audio-config') {
                 this.events.emit('log', `Audio config received: ${message.codec} ${message.sampleRate}Hz/${message.numberOfChannels}ch`);
-                this.decoder?.configureAudio(message).then(() => {
+                const decoder = this.decoder;
+                decoder?.configureAudio(message).then(() => {
+                    if (!this.sessions.isCurrent(sessionId) || decoder !== this.decoder)
+                        return;
                     this.audioConfigured = true;
-                    this.ensureDecodePump();
-                }).catch(error => this.fail(error));
+                    this.ensureDecodePump(sessionId);
+                }).catch(error => this.fail(error, sessionId));
             }
             else if (message.type === 'video-sample') {
                 if (this.sourceType === 'mp4')
@@ -863,15 +1019,25 @@ class HlsWebCodecsEngine {
                 }
                 this.videoQueueLength += 1;
                 this.pendingVideoSamples.push(message);
+                if (this.sourceType !== 'mp4') {
+                    const maxPending = Math.max(120, this.settings.maxRenderQueue * 4);
+                    const dropped = trimLiveVideoQueue(this.pendingVideoSamples, maxPending);
+                    if (dropped > 0) {
+                        this.videoQueueLength = Math.max(0, this.videoQueueLength - dropped);
+                        for (let i = 0; i < dropped; i += 1)
+                            this.stats.markDropped();
+                        this.seenKeyFrame = this.pendingVideoSamples.length > 0;
+                    }
+                }
                 if (this.videoConfigured)
-                    this.ensureDecodePump();
+                    this.ensureDecodePump(sessionId);
             }
             else if (message.type === 'audio-sample') {
                 if (this.sourceType === 'mp4')
                     this.mp4PullOutstanding = Math.max(0, this.mp4PullOutstanding - 1);
                 this.pendingAudioSamples.push(message);
                 if (this.audioConfigured)
-                    this.ensureDecodePump();
+                    this.ensureDecodePump(sessionId);
             }
             else if (message.type === 'stats') {
                 this.stats.patch({ videoTagCount: message.videoTagCount, audioSampleCount: message.audioTagCount });
@@ -880,14 +1046,21 @@ class HlsWebCodecsEngine {
                 this.events.emit('log', message.message);
             }
             else if (message.type === 'error') {
-                this.fail(new Error(message.message));
+                this.fail(new Error(message.message), sessionId);
             }
         }
         catch (error) {
-            this.fail(error instanceof Error ? error : new Error(String(error)));
+            this.fail(error instanceof Error ? error : new Error(String(error)), sessionId);
         }
     }
-    handleVideoFrame(frame) {
+    handleVideoFrame(frame, sessionId) {
+        if (!this.sessions.isCurrent(sessionId)) {
+            try {
+                frame.close();
+            }
+            catch { }
+            return;
+        }
         const timestamp = typeof frame.timestamp === 'number' ? frame.timestamp : 0;
         if (this.videoWallClockBaseUs === undefined) {
             this.videoWallClockBaseUs = timestamp;
@@ -896,7 +1069,7 @@ class HlsWebCodecsEngine {
         this.stats.markDecoded();
         this.renderQueue.push({ frame, timestamp });
         this.renderQueue.sort((a, b) => a.timestamp - b.timestamp);
-        while (this.renderQueue.length > 180) {
+        while (this.renderQueue.length > this.settings.maxRenderQueue) {
             const old = this.renderQueue.shift();
             try {
                 old?.frame.close();
@@ -905,9 +1078,18 @@ class HlsWebCodecsEngine {
             this.videoQueueLength = Math.max(0, this.videoQueueLength - 1);
             this.stats.markDropped();
         }
-        this.ensureRenderLoop();
+        this.ensureRenderLoop(sessionId);
+        if (this.pendingVideoSamples.length > 0)
+            this.ensureDecodePump(sessionId);
     }
-    handleAudioFrame(frame) {
+    handleAudioFrame(frame, sessionId) {
+        if (!this.sessions.isCurrent(sessionId)) {
+            try {
+                frame.close();
+            }
+            catch { }
+            return;
+        }
         try {
             this.audio?.enqueue(frame);
         }
@@ -915,27 +1097,32 @@ class HlsWebCodecsEngine {
             frame.close();
         }
     }
-    fail(error) {
+    fail(error, sessionId = this.sessions.current) {
+        if (!this.sessions.isCurrent(sessionId))
+            return;
+        this.sessions.invalidate();
+        this.releasePlaybackResources();
+        this.stats.patch({ lastError: error.message });
         this.state.transition('error');
         this.events.emit('state', this.state.current);
         this.events.emit('error', error);
     }
-    ensureRenderLoop() {
-        if (this.renderLoopId !== undefined)
+    ensureRenderLoop(sessionId = this.sessions.current) {
+        if (!this.sessions.isCurrent(sessionId) || this.renderLoopId !== undefined)
             return;
-        this.renderLoopId = window.setTimeout(() => this.renderTick(), 8);
+        this.renderLoopId = window.setTimeout(() => this.renderTick(sessionId), 8);
     }
-    ensureDecodePump() {
-        if (this.decodePumpId !== undefined)
+    ensureDecodePump(sessionId = this.sessions.current, delayMs = 0) {
+        if (!this.sessions.isCurrent(sessionId) || this.decodePumpId !== undefined)
             return;
-        this.decodePumpId = window.setTimeout(() => this.decodeTick(), 0);
+        this.decodePumpId = window.setTimeout(() => this.decodeTick(sessionId), delayMs);
     }
-    decodeTick() {
+    decodeTick(sessionId) {
         this.decodePumpId = undefined;
-        if (this.stopped || this.paused)
+        if (!this.sessions.isCurrent(sessionId) || this.stopped || this.paused)
             return;
         let videoBudget = this.settings.decodeBatchSize;
-        while (this.videoConfigured && videoBudget > 0 && this.pendingVideoSamples.length > 0 && this.renderQueue.length < 150) {
+        while (videoBudget > 0 && canDecodeVideo(this.videoConfigured, this.pendingVideoSamples.length, this.renderQueue.length, this.decoder?.videoDecodeQueueSize() || 0, this.settings.maxRenderQueue)) {
             const sample = this.pendingVideoSamples.shift();
             this.decoder?.decodeVideo(sample);
             videoBudget -= 1;
@@ -950,18 +1137,21 @@ class HlsWebCodecsEngine {
             audioBudget -= 1;
         }
         this.ensureMp4Pull();
-        if ((this.videoConfigured && this.pendingVideoSamples.length > 0 && this.renderQueue.length < 150)
-            || (this.audioConfigured && this.pendingAudioSamples.length > 0
-                && (this.audio?.queuedMs() || 0) < this.settings.audioMaxQueueMs * 1.25
-                && (this.decoder?.audioDecodeQueueSize() || 0) < 32)) {
-            this.ensureDecodePump();
+        const videoCanContinue = canDecodeVideo(this.videoConfigured, this.pendingVideoSamples.length, this.renderQueue.length, this.decoder?.videoDecodeQueueSize() || 0, this.settings.maxRenderQueue);
+        const audioCanContinue = this.audioConfigured && this.pendingAudioSamples.length > 0
+            && (this.audio?.queuedMs() || 0) < this.settings.audioMaxQueueMs * 1.25
+            && (this.decoder?.audioDecodeQueueSize() || 0) < 32;
+        if (videoCanContinue || audioCanContinue) {
+            this.ensureDecodePump(sessionId);
         }
-        else if (this.pendingAudioSamples.length > 0) {
-            this.decodePumpId = window.setTimeout(() => this.decodeTick(), 25);
+        else if (this.pendingVideoSamples.length > 0 || this.pendingAudioSamples.length > 0) {
+            this.ensureDecodePump(sessionId, 12);
         }
     }
-    renderTick() {
+    renderTick(sessionId) {
         this.renderLoopId = undefined;
+        if (!this.sessions.isCurrent(sessionId))
+            return;
         if (this.stopped) {
             this.clearRenderQueue();
             return;
@@ -994,7 +1184,7 @@ class HlsWebCodecsEngine {
             this.stats.markDropped();
         }
         if (this.renderQueue.length > 0)
-            this.ensureRenderLoop();
+            this.ensureRenderLoop(sessionId);
         this.ensureMp4Pull();
     }
     videoDelayMs(timestamp) {
@@ -1026,6 +1216,40 @@ class HlsWebCodecsEngine {
             }
             catch { }
         }
+    }
+    releasePlaybackResources() {
+        this.stopped = true;
+        this.paused = false;
+        const worker = this.worker;
+        this.worker = undefined;
+        if (worker) {
+            worker.onmessage = null;
+            worker.onerror = null;
+            try {
+                worker.postMessage({ type: 'stop' });
+            }
+            catch { }
+            worker.terminate();
+        }
+        this.decoder?.close();
+        this.decoder = undefined;
+        this.audio?.close();
+        this.audio = undefined;
+        this.videoQueueLength = 0;
+        this.videoConfigured = false;
+        this.audioConfigured = false;
+        this.seenKeyFrame = false;
+        this.pendingVideoSamples = [];
+        this.pendingAudioSamples = [];
+        this.mp4PullOutstanding = 0;
+        this.videoWallClockBaseUs = undefined;
+        this.videoWallClockBaseMs = undefined;
+        this.clearDecodePump();
+        this.clearRenderQueue();
+        try {
+            this.renderer.clear();
+        }
+        catch { }
     }
     clearRenderQueue() {
         if (this.renderLoopId !== undefined) {
@@ -1117,9 +1341,86 @@ class H265WebEngine {
     seek(time) { this.instance?.seek?.(time); }
 }
 
+function resolveEngineRoute(sourceType, decoderMode = 'auto', enableH265Web = false) {
+    if (sourceType === 'h265')
+        return enableH265Web ? 'h265web' : 'unsupported';
+    if (sourceType === 'hls' || sourceType === 'mp4') {
+        return decoderMode === 'wasm' ? 'unsupported' : 'webcodecs';
+    }
+    if (sourceType === 'http-flv' || sourceType === 'ws-flv') {
+        return decoderMode === 'webcodecs' ? 'webcodecs' : 'jessibuca';
+    }
+    return 'unsupported';
+}
+
+function createFullscreenControl(player) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = 'Fullscreen';
+    button.onclick = () => player.fullscreen();
+    return button;
+}
+
+function createPlayButton(player) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = 'Play';
+    button.onclick = () => player.play().catch(error => player.events.emit('error', error));
+    return button;
+}
+
+function createScreenshotControl(player) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = 'Shot';
+    button.onclick = () => {
+        const url = player.screenshot();
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `tesla-frame-${Date.now()}.png`;
+        link.click();
+    };
+    return button;
+}
+
+function createVolumeControl(player) {
+    const input = document.createElement('input');
+    input.type = 'range';
+    input.min = '0';
+    input.max = '1';
+    input.step = '0.01';
+    input.value = '1';
+    input.oninput = () => player.setVolume(Number(input.value));
+    return input;
+}
+
 /*
- * Tesla-VideoPlayer runtime now delegates playback to Jessibuca OSS directly.
- * Jessibuca is licensed under GPL-3.0. See THIRD_PARTY_NOTICES.md.
+ * Lightweight Jessibuca-style control bar for Tesla no-video player.
+ */
+class ControlBar {
+    constructor(player) {
+        this.player = player;
+        this.element = document.createElement('div');
+        this.element.className = 'tesla-control-bar';
+        this.element.style.cssText = 'position:absolute;left:0;right:0;bottom:0;z-index:20;display:flex;gap:8px;align-items:center;padding:8px;background:rgba(17,17,17,.85);color:#fff;';
+        const pause = document.createElement('button');
+        pause.type = 'button';
+        pause.textContent = 'Pause';
+        pause.onclick = () => this.player.pause();
+        const stop = document.createElement('button');
+        stop.type = 'button';
+        stop.textContent = 'Stop';
+        stop.onclick = () => this.player.stop();
+        this.element.append(createPlayButton(player), pause, stop, createVolumeControl(player), createFullscreenControl(player), createScreenshotControl(player));
+    }
+    destroy() {
+        this.element.remove();
+    }
+}
+
+/*
+ * Tesla-VideoPlayer runtime uses Tesla's WebCodecs worker pipeline and the
+ * vendored Jessibuca WASM runtime without HTML video or MSE fallback.
  */
 let jessibucaLoader;
 function loadJessibuca(scriptUrl = new URL('./jessibuca.js', import.meta.url).href) {
@@ -1140,10 +1441,8 @@ function loadJessibuca(scriptUrl = new URL('./jessibuca.js', import.meta.url).hr
 class TeslaPlayer {
     constructor(containerOrOptions, maybeOptions = {}) {
         var _a, _b;
-        this.containerOrOptions = containerOrOptions;
         this.events = new PlayerEvents();
         this.state = new PlayerStateMachine();
-        this.stats = new PlayerStatsTracker();
         this.guard = new NoVideoGuard();
         this.activeEngine = 'none';
         this.url = '';
@@ -1152,112 +1451,116 @@ class TeslaPlayer {
         this.firstFrameSeen = false;
         this.volume = 1;
         this.handlers = [];
+        this.reconnectAttempts = 0;
         this.on = this.events.on.bind(this.events);
         this.off = this.events.off.bind(this.events);
-        this.options = containerOrOptions instanceof HTMLElement
+        const supplied = containerOrOptions instanceof HTMLElement
             ? { ...maybeOptions, container: containerOrOptions }
             : containerOrOptions;
+        this.options = normalizePlayerOptions(supplied);
         if (!this.options.container)
             throw new Error('createTeslaPlayer requires a container element.');
         (_a = this.options.container.style).position || (_a.position = 'relative');
         (_b = this.options.container.style).background || (_b.background = '#000');
-        this.guard.start(count => this.fail(new Error(`video elements are forbidden, found ${count}.`)));
-        this.stats.patch({
-            decoderType: 'wasm',
-            rendererType: 'canvas2d',
-            audioType: 'webaudio'
-        });
-        if (this.options.url)
+        this.stats = new PlayerStatsTracker(this.options.container);
+        this.volume = this.options.volume ?? 1;
+        this.guard.start(count => this.fail(new Error(`video elements are forbidden, found ${count}.`)), this.options.container);
+        this.syncControls();
+        if (this.options.url) {
             this.load(this.options.url, this.options);
+            if (this.options.autoplay) {
+                queueMicrotask(() => this.play().catch(error => this.handlePlaybackError(normalizeError(error))));
+            }
+        }
     }
     load(url, options = {}) {
+        if (this.state.current === 'destroyed')
+            throw new Error('Cannot load media after destroy().');
         this.url = url;
-        this.options = { ...this.options, ...options };
+        this.options = normalizePlayerOptions({ ...this.options, ...options, container: this.options.container });
         this.sourceType = options.sourceType || inferSourceType(url);
-        this.stats.patch({ sourceType: this.sourceType, lastError: '' });
+        this.volume = this.options.volume ?? this.volume;
+        this.stats.resetSession({ sourceType: this.sourceType, lastError: '' });
+        this.applyWebCodecsOptions();
+        this.jess?.setVolume(this.volume);
+        this.hls?.setVolume(this.volume);
+        this.h265?.setVolume(this.volume);
+        this.syncControls();
     }
     async play(url, options = {}) {
         if (url)
             this.load(url, options);
         if (!this.url)
             throw new Error('Playback URL is required.');
-        if (this.sourceType === 'hls' || this.sourceType === 'mp4') {
-            await this.playWithHlsEngine();
-            return;
-        }
-        if (this.sourceType === 'h265') {
-            if (!this.options.enableH265Web) {
-                this.fail(new Error('h265web.js is studied but disabled by default for Tesla no-video mode. Set enableH265Web only after supplying its missing runtime/wasm assets.'));
-                return;
-            }
-            await this.playWithH265WebEngine();
-            return;
-        }
-        await this.ensureJessibuca();
-        this.firstFrameStart = performance.now();
-        this.firstFrameSeen = false;
-        this.state.transition('loading');
-        this.events.emit('state', this.state.current);
-        await this.jess.play(this.url);
+        if (this.state.current === 'destroyed')
+            throw new Error('Cannot play media after destroy().');
+        this.clearReconnectTimer();
+        this.reconnectAttempts = 0;
+        await this.playCurrent(false);
     }
     pause() {
-        if (this.activeEngine === 'hls')
+        if (this.activeEngine === 'webcodecs')
             this.hls?.pause();
         else if (this.activeEngine === 'h265web')
             this.h265?.pause();
+        else if (this.activeEngine === 'jessibuca')
+            this.jess?.pause().catch(error => this.handlePlaybackError(normalizeError(error)));
         else
-            this.jess?.pause().catch(error => this.fail(error));
+            return;
         this.state.transition('paused');
         this.events.emit('state', this.state.current);
     }
     async resume() {
-        if (this.activeEngine === 'hls')
+        if (this.activeEngine === 'webcodecs')
             await this.hls?.resume();
         else if (this.activeEngine === 'h265web')
             await this.h265?.play(this.url);
-        else
+        else if (this.activeEngine === 'jessibuca')
             await this.jess?.play();
     }
     stop() {
-        if (this.activeEngine === 'hls')
-            this.hls?.stop();
-        else if (this.activeEngine === 'h265web')
-            this.h265?.stop();
-        else
-            this.jess?.close();
+        this.clearReconnectTimer();
+        this.reconnectAttempts = 0;
+        this.stopActiveEngine();
+        this.activeEngine = 'none';
         this.state.transition('stopped');
         this.events.emit('state', this.state.current);
     }
     destroy() {
-        this.jess?.destroy();
+        if (this.state.current === 'destroyed')
+            return;
+        this.clearReconnectTimer();
+        this.destroyJessibuca();
         this.hls?.destroy();
         this.h265?.destroy();
-        this.jess = undefined;
         this.hls = undefined;
         this.h265 = undefined;
-        this.handlers = [];
+        this.controlBar?.destroy();
+        this.controlBar = undefined;
+        this.activeEngine = 'none';
         this.guard.stop();
-        this.events.clear();
         this.state.transition('destroyed');
+        this.events.clear();
     }
     seek(time) {
-        if (this.activeEngine === 'hls' && (this.sourceType === 'mp4' || this.sourceType === 'hls')) {
-            this.hls?.seek(time).catch(error => this.fail(error instanceof Error ? error : new Error(String(error))));
+        if (this.activeEngine === 'webcodecs' && (this.sourceType === 'mp4' || this.sourceType === 'hls')) {
+            this.hls?.seek(time).catch(error => this.handlePlaybackError(normalizeError(error)));
             return;
         }
         this.fail(new Error(`seek() is only supported for MP4/HLS on-demand playback; current source is ${this.sourceType}.`));
     }
     setVolume(volume) {
         this.volume = Math.max(0, Math.min(1, Number(volume) || 0));
+        this.options.volume = this.volume;
         this.jess?.setVolume(this.volume);
         this.hls?.setVolume(this.volume);
         this.h265?.setVolume(this.volume);
     }
     setPlaybackRate(rate) {
-        this.events.emit('log', `Jessibuca FLV live playbackRate is not exposed; requested ${rate}.`);
+        this.events.emit('log', `Playback-rate control is not supported by the selected ${this.activeEngine} engine; requested ${rate}.`);
     }
     screenshot() {
-        if (this.activeEngine === 'hls') {
+        if (this.activeEngine === 'webcodecs') {
             const canvas = this.options.container.querySelector('canvas');
             return canvas ? canvas.toDataURL('image/png') : '';
         }
@@ -1272,25 +1575,66 @@ class TeslaPlayer {
             target.requestFullscreen?.().catch(() => undefined);
     }
     getStats() {
-        if (this.activeEngine === 'hls' && this.hls) {
-            return { ...this.hls.getStats(), sourceType: this.sourceType };
+        const outer = this.stats.snapshot();
+        if (this.activeEngine === 'webcodecs' && this.hls) {
+            const engine = this.hls.getStats();
+            return {
+                ...engine,
+                sourceType: this.sourceType,
+                reconnectCount: outer.reconnectCount,
+                lastError: outer.lastError || engine.lastError
+            };
         }
-        return this.stats.snapshot();
+        return outer;
     }
     getState() {
         return this.state.current;
     }
-    async ensureJessibuca() {
-        if (this.jess)
+    async playCurrent(isReconnect) {
+        const route = resolveEngineRoute(this.sourceType, this.options.decoderMode, !!this.options.enableH265Web);
+        if (!isReconnect) {
+            this.stats.resetSession({
+                sourceType: this.sourceType,
+                decoderType: route === 'webcodecs' ? 'webcodecs' : route === 'jessibuca' || route === 'h265web' ? 'wasm' : 'none',
+                rendererType: route === 'webcodecs'
+                    ? (this.options.renderer === 'canvas' ? 'canvas2d' : 'webgl')
+                    : route === 'jessibuca' || route === 'h265web' ? 'canvas2d' : 'none',
+                audioType: 'webaudio'
+            });
+        }
+        if (route === 'webcodecs') {
+            await this.playWithWebCodecsEngine();
             return;
+        }
+        if (route === 'jessibuca') {
+            await this.playWithJessibuca();
+            return;
+        }
+        if (route === 'h265web') {
+            await this.playWithH265WebEngine();
+            return;
+        }
+        if ((this.sourceType === 'hls' || this.sourceType === 'mp4') && this.options.decoderMode === 'wasm') {
+            throw new Error('decoderMode="wasm" is not available for MP4/HLS because the typed WASM bridge is not implemented. Use decoderMode="auto" or "webcodecs".');
+        }
+        if (this.sourceType === 'h265') {
+            throw new Error('H.265 experimental playback requires enableH265Web and supplied h265web.js runtime/wasm assets.');
+        }
+        throw new Error(`Unsupported or unrecognized media source: ${this.url}`);
+    }
+    async playWithJessibuca() {
         this.hls?.destroy();
         this.hls = undefined;
-        this.activeEngine = 'jessibuca';
+        this.h265?.destroy();
+        this.h265 = undefined;
+        this.destroyJessibuca();
         await loadJessibuca(this.options.jessibucaUrl || new URL('./jessibuca.js', import.meta.url).href);
         const Jessibuca = window.Jessibuca;
         if (!Jessibuca)
             throw new Error('Jessibuca constructor is not available.');
         this.options.container.innerHTML = '';
+        this.options.reconnect !== false;
+        const retries = this.options.reconnectMaxRetries ?? 3;
         this.jess = new Jessibuca({
             container: this.options.container,
             decoder: this.options.decoderUrl || new URL('./decoder.js', import.meta.url).href,
@@ -1305,72 +1649,103 @@ class TeslaPlayer {
             debug: !!this.options.debug,
             loadingText: this.options.loadingText || 'loading',
             showBandwidth: true,
-            operateBtns: {
+            operateBtns: this.options.controls ? {
                 fullscreen: true,
                 screenshot: true,
                 play: true,
                 audio: true,
                 record: false
+            } : {
+                fullscreen: false,
+                screenshot: false,
+                play: false,
+                audio: false,
+                record: false
             },
-            heartTimeoutReplay: true,
-            heartTimeoutReplayTimes: 3,
-            loadingTimeoutReplay: true,
-            loadingTimeoutReplayTimes: 3,
-            wasmDecodeErrorReplay: true
+            // TeslaPlayer owns the retry timer so all engines follow the same policy.
+            heartTimeoutReplay: false,
+            heartTimeoutReplayTimes: retries,
+            loadingTimeoutReplay: false,
+            loadingTimeoutReplayTimes: retries,
+            wasmDecodeErrorReplay: false
         });
         this.bindJessibucaEvents(this.jess);
         this.jess.setVolume(this.volume);
+        this.activeEngine = 'jessibuca';
+        this.firstFrameStart = performance.now();
+        this.firstFrameSeen = false;
+        this.state.transition('loading');
+        this.events.emit('state', this.state.current);
+        this.syncControls();
+        await this.jess.play(this.url);
     }
-    async playWithHlsEngine() {
-        this.jess?.destroy();
-        this.jess = undefined;
+    async playWithWebCodecsEngine() {
+        this.destroyJessibuca();
         this.h265?.destroy();
         this.h265 = undefined;
         if (!this.hls) {
             this.options.container.innerHTML = '';
-            this.hls = new HlsWebCodecsEngine({
-                container: this.options.container,
-                renderer: this.options.renderer === 'canvas' ? 'canvas2d' : 'webgl',
-                workerUrl: this.options.workerUrl,
-                fitMode: this.options.fitMode,
-                liveStartSegmentCount: this.options.liveStartSegmentCount ?? 3,
-                liveSegmentBatch: this.options.liveSegmentBatch ?? 2,
-                audioMaxQueueMs: this.options.audioMaxQueueMs ?? 1200,
-                decodeBatchSize: this.options.decodeBatchSize,
-                maxRenderQueue: this.options.maxRenderQueue,
-                lateDropMs: this.options.lateDropMs
-            });
+            this.hls = new HlsWebCodecsEngine(this.webCodecsOptions());
             this.bindHlsEvents(this.hls);
-            this.hls.setVolume(this.volume);
         }
-        this.activeEngine = 'hls';
-        this.stats.patch({ sourceType: this.sourceType, decoderType: 'webcodecs', rendererType: this.options.renderer === 'canvas' ? 'canvas2d' : 'webgl', audioType: 'webaudio' });
+        else {
+            this.applyWebCodecsOptions();
+        }
+        this.hls.setVolume(this.volume);
+        this.activeEngine = 'webcodecs';
+        this.syncControls();
         await this.hls.play(this.url, this.sourceType);
     }
     async playWithH265WebEngine() {
-        this.jess?.destroy();
-        this.jess = undefined;
+        this.destroyJessibuca();
         this.hls?.destroy();
         this.hls = undefined;
         if (!this.h265)
             this.h265 = new H265WebEngine(this.options.container, this.options);
         this.activeEngine = 'h265web';
         this.state.transition('loading');
-        this.stats.patch({
-            sourceType: 'h265',
-            decoderType: 'wasm',
-            rendererType: 'canvas2d',
-            audioType: 'webaudio',
-            lastError: ''
-        });
         this.events.emit('state', this.state.current);
+        this.syncControls();
         try {
             await this.h265.play(this.url);
-            this.state.transition('playing');
-            this.events.emit('state', this.state.current);
+            this.markPlaying();
         }
         catch (error) {
-            this.fail(error instanceof Error ? error : new Error(String(error)));
+            this.handlePlaybackError(normalizeError(error));
+        }
+    }
+    webCodecsOptions() {
+        return {
+            container: this.options.container,
+            renderer: this.options.renderer === 'canvas' ? 'canvas2d' : 'webgl',
+            workerUrl: this.options.workerUrl,
+            fitMode: this.options.fitMode,
+            preset: this.options.preset,
+            liveStartSegmentCount: this.options.liveStartSegmentCount ?? 3,
+            liveSegmentBatch: this.options.liveSegmentBatch ?? 2,
+            audioMaxQueueMs: this.options.audioMaxQueueMs ?? 1200,
+            decodeBatchSize: this.options.decodeBatchSize,
+            maxRenderQueue: this.options.maxRenderQueue,
+            lateDropMs: this.options.lateDropMs
+        };
+    }
+    applyWebCodecsOptions() {
+        if (!this.hls)
+            return;
+        const values = this.webCodecsOptions();
+        this.hls.updateSettings(values);
+        this.hls.setRenderer(values.renderer || 'webgl');
+    }
+    syncControls() {
+        if (!this.options.controls) {
+            this.controlBar?.destroy();
+            this.controlBar = undefined;
+            return;
+        }
+        if (!this.controlBar || !this.controlBar.element.isConnected) {
+            this.controlBar?.destroy();
+            this.controlBar = new ControlBar(this);
+            this.options.container.appendChild(this.controlBar.element);
         }
     }
     bindHlsEvents(engine) {
@@ -1378,10 +1753,11 @@ class TeslaPlayer {
             this.state.transition(state);
             this.events.emit('state', this.state.current);
         });
-        engine.events.on('error', error => this.fail(error));
+        engine.events.on('error', error => this.handlePlaybackError(error));
         engine.events.on('log', message => this.events.emit('log', message));
         engine.events.on('firstFrame', ms => {
-            this.stats.patch({ firstFrameTimeMs: ms });
+            this.reconnectAttempts = 0;
+            this.stats.patch({ firstFrameTimeMs: ms, lastError: '' });
             this.events.emit('firstFrame', ms);
         });
     }
@@ -1393,14 +1769,10 @@ class TeslaPlayer {
         bind('load', () => this.events.emit('log', 'Jessibuca loaded.'));
         bind('start', () => this.markPlaying());
         bind('play', () => this.markPlaying());
-        bind('error', (error) => this.fail(new Error(typeof error === 'string' ? error : JSON.stringify(error))));
-        bind('timeout', (payload) => this.fail(new Error(`Jessibuca timeout: ${JSON.stringify(payload)}`)));
-        bind('videoInfo', (info) => {
-            this.events.emit('log', `Video ${info?.encType || ''} ${info?.width || 0}x${info?.height || 0}`);
-        });
-        bind('audioInfo', (info) => {
-            this.events.emit('log', `Audio ${info?.encType || ''} ${info?.sampleRate || 0}Hz/${info?.channels || 0}ch`);
-        });
+        bind('error', (error) => this.handlePlaybackError(new Error(typeof error === 'string' ? error : JSON.stringify(error))));
+        bind('timeout', (payload) => this.handlePlaybackError(new Error(`Jessibuca timeout: ${JSON.stringify(payload)}`)));
+        bind('videoInfo', (info) => this.events.emit('log', `Video ${info?.encType || ''} ${info?.width || 0}x${info?.height || 0}`));
+        bind('audioInfo', (info) => this.events.emit('log', `Audio ${info?.encType || ''} ${info?.sampleRate || 0}Hz/${info?.channels || 0}ch`));
         bind('stats', (payload) => {
             const stats = typeof payload === 'string' ? safeJson(payload) : payload || {};
             this.stats.patch({
@@ -1419,6 +1791,9 @@ class TeslaPlayer {
         });
     }
     markPlaying() {
+        this.clearReconnectTimer();
+        this.reconnectAttempts = 0;
+        this.stats.patch({ lastError: '' });
         if (!this.firstFrameSeen) {
             this.firstFrameSeen = true;
             const firstFrameTimeMs = Math.round(performance.now() - this.firstFrameStart);
@@ -1428,7 +1803,63 @@ class TeslaPlayer {
         this.state.transition('playing');
         this.events.emit('state', this.state.current);
     }
+    handlePlaybackError(error) {
+        if (this.state.current === 'destroyed' || this.reconnectTimer !== undefined)
+            return;
+        const canReconnect = this.options.reconnect !== false
+            && (this.sourceType === 'http-flv' || this.sourceType === 'ws-flv' || this.sourceType === 'hls')
+            && this.reconnectAttempts < (this.options.reconnectMaxRetries ?? 3);
+        if (!canReconnect) {
+            this.fail(error);
+            return;
+        }
+        this.stopActiveEngine();
+        this.activeEngine = 'none';
+        this.reconnectAttempts += 1;
+        this.stats.incrementReconnect();
+        this.stats.patch({ lastError: error.message });
+        this.events.emit('reconnect', this.reconnectAttempts);
+        this.state.transition('loading');
+        this.events.emit('state', this.state.current);
+        const delay = (this.options.reconnectDelayMs ?? 1000) * this.reconnectAttempts;
+        this.clearReconnectTimer();
+        this.reconnectTimer = window.setTimeout(() => {
+            this.reconnectTimer = undefined;
+            this.playCurrent(true).catch(next => this.handlePlaybackError(normalizeError(next)));
+        }, delay);
+    }
+    stopActiveEngine() {
+        if (this.activeEngine === 'webcodecs')
+            this.hls?.stop();
+        else if (this.activeEngine === 'h265web')
+            this.h265?.stop();
+        else if (this.activeEngine === 'jessibuca')
+            this.jess?.close();
+    }
+    destroyJessibuca() {
+        if (!this.jess)
+            return;
+        for (const { event, handler } of this.handlers)
+            this.jess.off?.(event, handler);
+        this.handlers = [];
+        try {
+            this.jess.destroy();
+        }
+        catch { }
+        this.jess = undefined;
+    }
+    clearReconnectTimer() {
+        if (this.reconnectTimer !== undefined) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = undefined;
+        }
+    }
     fail(error) {
+        if (this.state.current === 'destroyed')
+            return;
+        this.clearReconnectTimer();
+        this.stopActiveEngine();
+        this.activeEngine = 'none';
         this.state.transition('error');
         this.stats.patch({ lastError: error.message });
         this.events.emit('state', this.state.current);
@@ -1442,6 +1873,9 @@ function safeJson(text) {
     catch {
         return {};
     }
+}
+function normalizeError(error) {
+    return error instanceof Error ? error : new Error(String(error));
 }
 function createTeslaPlayer(container, options = {}) {
     return new TeslaPlayer(container, options);

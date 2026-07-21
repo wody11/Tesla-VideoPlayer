@@ -1,4 +1,4 @@
-// Thin WebCodecs wrapper. TODO: add a Tesla-owned WASM decoder fallback.
+// Thin WebCodecs wrapper used by the active Tesla worker pipeline.
 export interface WebCodecsDecoderSink {
   onVideoFrame(frame: any): void;
   onAudioFrame(frame: any): void;

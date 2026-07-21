@@ -121,9 +121,17 @@ export class WebAudioPlayer {
     };
   }
 
-  close(): void {
+  reset(): void {
     this.stopScheduledSources();
     this.clock.reset();
+    this.scheduledUntil = this.context.currentTime;
+    this.enqueuedFrames = 0;
+    this.lastFrameSamples = 0;
+    this.lastTimestampUs = 0;
+  }
+
+  close(): void {
+    this.reset();
     this.context.close().catch(() => undefined);
   }
 

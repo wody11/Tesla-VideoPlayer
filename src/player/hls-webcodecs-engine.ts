@@ -29,7 +29,7 @@ export interface HlsWebCodecsEngineOptions {
 export class HlsWebCodecsEngine {
   readonly events = new PlayerEvents();
   private state = new PlayerStateMachine();
-  private stats = new PlayerStatsTracker();
+  private stats: PlayerStatsTracker;
   private sessions = new SessionGeneration();
   private canvas: HTMLCanvasElement;
   private renderer: CanvasRenderer | WebGLRenderer;
@@ -67,6 +67,7 @@ export class HlsWebCodecsEngine {
   };
 
   constructor(private options: HlsWebCodecsEngineOptions) {
+    this.stats = new PlayerStatsTracker(options.container);
     this.canvas = document.createElement('canvas');
     this.canvas.style.width = '100%';
     this.canvas.style.height = '100%';
@@ -97,6 +98,12 @@ export class HlsWebCodecsEngine {
     this.sourceType = sourceType;
     this.currentUrl = url;
     this.mp4PullOutstanding = 0;
+    this.stats.resetSession({
+      sourceType,
+      decoderType: 'webcodecs',
+      rendererType: this.renderer.type,
+      audioType: 'webaudio'
+    });
     this.firstFrameStart = performance.now();
     this.firstFrameSeen = false;
     this.state.transition('loading');
@@ -120,11 +127,7 @@ export class HlsWebCodecsEngine {
         }
       });
 
-      const decoder = new WebCodecsDecoder({
-        onVideoFrame: frame => this.handleVideoFrame(frame, sessionId),
-        onAudioFrame: frame => this.handleAudioFrame(frame, sessionId),
-        onError: error => this.fail(error, sessionId)
-      });
+      const decoder = this.createDecoder(sessionId);
       this.decoder = decoder;
       this.stats.patch({ decoderType: 'webcodecs' });
 
@@ -208,18 +211,21 @@ export class HlsWebCodecsEngine {
       audioFrameSamples: audioDiagnostics?.lastFrameSamples || 0,
       audioContextState: audioDiagnostics?.contextState || 'closed',
       videoQueueLength: this.videoQueueLength,
-      currentTimeMs: this.audio?.currentTimeMs() || 0
+      currentTimeMs: this.audio?.currentTimeMs() || 0,
+      currentTime: (this.audio?.currentTimeMs() || 0) / 1000
     });
     return this.stats.snapshot();
   }
 
   setRenderer(type: 'canvas2d' | 'webgl'): void {
+    if (this.renderer.type === type) return;
     this.renderer.destroy();
     this.renderer = this.createRenderer(type);
     this.stats.patch({ rendererType: this.renderer.type });
   }
 
   updateSettings(values: Partial<HlsWebCodecsEngineOptions>): void {
+    this.options = { ...this.options, ...values };
     if (values.preset) {
       const preset = PLAYBACK_PRESETS[values.preset];
       if (preset) {
@@ -251,6 +257,33 @@ export class HlsWebCodecsEngine {
     }
   }
 
+  private createDecoder(sessionId: number): WebCodecsDecoder {
+    return new WebCodecsDecoder({
+      onVideoFrame: frame => this.handleVideoFrame(frame, sessionId),
+      onAudioFrame: frame => this.handleAudioFrame(frame, sessionId),
+      onError: error => this.fail(error, sessionId)
+    });
+  }
+
+  private resetForDiscontinuity(sessionId: number, sequence: number): void {
+    if (!this.sessions.isCurrent(sessionId)) return;
+    this.decoder?.close();
+    this.decoder = this.createDecoder(sessionId);
+    this.audio?.reset();
+    this.videoConfigured = false;
+    this.audioConfigured = false;
+    this.seenKeyFrame = false;
+    this.pendingVideoSamples = [];
+    this.pendingAudioSamples = [];
+    this.videoQueueLength = 0;
+    this.videoWallClockBaseUs = undefined;
+    this.videoWallClockBaseMs = undefined;
+    this.clearDecodePump();
+    this.clearRenderQueue();
+    this.stats.markDiscontinuity();
+    this.events.emit('log', `HLS discontinuity at media sequence ${sequence}; decoder and AV clocks reset.`);
+  }
+
   private handleWorkerEvent(message: TeslaWorkerEvent, sessionId: number): void {
     if (!this.sessions.isCurrent(sessionId) || this.stopped) return;
     try {
@@ -258,6 +291,10 @@ export class HlsWebCodecsEngine {
         this.events.emit('log', 'Stream opened.');
       } else if (message.type === 'stream-end') {
         this.events.emit('log', 'Stream ended.');
+      } else if (message.type === 'discontinuity') {
+        this.resetForDiscontinuity(sessionId, message.sequence);
+      } else if (message.type === 'download-progress') {
+        this.stats.patch({ downloadedBytes: message.loaded, totalBytes: message.total || 0 });
       } else if (message.type === 'media-info') {
         this.stats.patch({ duration: message.duration });
         this.events.emit('log', `Media info: ${message.videoCodec || 'no video'} / ${message.audioCodec || 'no audio'}, ${message.duration.toFixed(2)}s.`);

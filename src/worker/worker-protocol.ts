@@ -1,4 +1,4 @@
-// Narrow protocol between the main-thread player and Tesla's own FLV worker.
+// Narrow protocol between the main-thread player and Tesla's active no-video worker.
 export type TeslaWorkerCommand =
   | { type: 'open-http-flv'; url: string }
   | { type: 'open-ws-flv'; url: string }
@@ -12,6 +12,8 @@ export type TeslaWorkerCommand =
 export type TeslaWorkerEvent =
   | { type: 'stream-open' }
   | { type: 'stream-end' }
+  | { type: 'discontinuity'; sequence: number }
+  | { type: 'download-progress'; loaded: number; total?: number }
   | { type: 'media-info'; duration: number; videoCodec?: string; audioCodec?: string }
   | { type: 'video-config'; codec: string; description?: ArrayBuffer; annexb?: boolean }
   | { type: 'audio-config'; codec: string; description: ArrayBuffer; sampleRate: number; numberOfChannels: number }

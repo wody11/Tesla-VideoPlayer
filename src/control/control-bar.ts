@@ -14,7 +14,7 @@ export class ControlBar {
   constructor(private player: TeslaPlayer) {
     this.element = document.createElement('div');
     this.element.className = 'tesla-control-bar';
-    this.element.style.cssText = 'display:flex;gap:8px;align-items:center;padding:8px;background:#111;color:#fff;';
+    this.element.style.cssText = 'position:absolute;left:0;right:0;bottom:0;z-index:20;display:flex;gap:8px;align-items:center;padding:8px;background:rgba(17,17,17,.85);color:#fff;';
     const pause = document.createElement('button');
     pause.type = 'button';
     pause.textContent = 'Pause';

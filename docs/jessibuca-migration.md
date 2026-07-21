@@ -1,36 +1,51 @@
 # Jessibuca Migration Notes
 
-Tesla-VideoPlayer was reorganized using Jessibuca open source edition as the architectural reference.
+Tesla-VideoPlayer uses Jessibuca as an architectural reference and vendors its
+runtime for the FLV software-decoding route.
 
-## Jessibuca-Inspired Modules
+## Current relationship
 
-- Player lifecycle, state/events/stats separation: `src/player/*`
-- Worker command/event boundary: `src/worker/worker-protocol.ts`, `worker-client.ts`, `worker-session.ts`
-- Stream loader split: `src/stream/http-loader.ts`, `websocket-loader.ts`
-- FLV parsing boundary: `src/demux/flv/*`
-- Decoder abstraction and fallback policy: `src/decoder/*`
-- Render/audio/control separation: `src/render/*`, `src/audio/*`, `src/control/*`
-- Drop-frame and AV-sync policy modules: `src/sync/*`
+- FLV + `decoderMode: "auto"` or `"wasm"` uses the vendored Jessibuca runtime.
+- FLV + `decoderMode: "webcodecs"` uses Tesla's Worker/WebCodecs route.
+- HLS and MP4 use Tesla's Worker/WebCodecs route.
+- Jessibuca MSE and HTML-video paths are disabled in Tesla integration.
 
-## Tesla-Origin Modules Retained
+The project is GPL-3.0-only. See `THIRD_PARTY_NOTICES.md` and the vendored license
+files.
 
-- WebCodecs H.264/AAC decode path
-- HLS/m3u8 playlist and TS demux logic
-- Canvas/WebGL no-video rendering
-- WebAudio scheduling and audio clock
-- Tesla demo diagnostics for video/canvas tag counts
-- No-video runtime guard
+## Jessibuca-inspired structure
 
-## Runtime Dependency Decision
+- public facade vs. internal engines;
+- explicit lifecycle, state, events, and stats;
+- Worker command/event boundary;
+- stream/demux/decode/render/audio separation;
+- bounded buffering, error naming, and reconnect policy;
+- optional controls and diagnostics.
 
-The final build does not depend on the old top-level `jessibuca/` checkout. Jessibuca runtime assets are vendored in `vendor/jessibuca-runtime/`, and a source snapshot is vendored in `vendor/jessibuca-src/`.
+## Tesla-owned implementation
 
-## Incomplete Feature Parity
+- HLS playlist parsing and MPEG-TS demux;
+- progressive MP4 Range/stream ingestion and MP4Box demux;
+- WebCodecs decoder management;
+- Canvas2D/WebGL rendering;
+- WebAudio scheduling and media clock;
+- session generation and stale-callback rejection;
+- HLS discontinuity reset;
+- scoped NoVideoGuard and per-session stats.
 
-Not every Jessibuca feature is fully implemented yet. The code marks incomplete areas with TODOs and explicit runtime errors:
+## Removed migration scaffolding
 
-- WASM soft decoding bridge
-- H.265/G711 decoding on no-video path
-- MP4 VOD sample extraction
-- OffscreenCanvas rendering
-- AudioWorklet scheduling
+The old parallel Worker implementation, unused Worker bundle, empty loader
+facades, and placeholder modules were removed. There is one active Worker entry:
+`src/worker/worker-entry.ts`.
+
+## Remaining gaps
+
+These are explicit product limitations, not silent fallbacks:
+
+- no typed software-decoder bridge for HLS/MP4;
+- no HLS SAMPLE-AES or fMP4/CMAF;
+- no G.711/Opus path in Tesla WebCodecs FLV;
+- no playback-rate implementation;
+- h265web.js requires external runtime/WASM assets;
+- no OffscreenCanvas or AudioWorklet path.

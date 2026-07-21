@@ -104,6 +104,11 @@ Do not migrate:
 
 ## Current Tesla Status
 
+This integration remains experimental after the progressive-MP4 and API work.
+It is not part of the normal HLS/MP4 codec route, and `decoderMode` does not
+automatically select it.
+
+
 Tesla includes a disabled integration layer in `src/player/h265web-engine.ts`.
 
 It is not automatically selected by URL inference. It only runs when `sourceType: "h265"` and `enableH265Web: true` are explicitly provided, and it will still fail clearly until the missing runtime file is supplied:

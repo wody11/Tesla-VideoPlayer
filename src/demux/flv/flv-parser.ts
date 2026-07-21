@@ -72,7 +72,7 @@ export class FlvParser {
     const frameType = payload[0] >> 4;
     const codecId = payload[0] & 0x0f;
     if (codecId !== 7) {
-      this.emit({ type: 'error', message: `Unsupported FLV video codec ${codecId}; H.265/WASM fallback is TODO in no-video mode.` });
+      this.emit({ type: 'error', message: `Unsupported FLV video codec ${codecId}; this parser supports H.264/AVC only.` });
       return;
     }
     const packetType = payload[1];
@@ -91,7 +91,7 @@ export class FlvParser {
     if (payload.length < 2) return;
     const soundFormat = payload[0] >> 4;
     if (soundFormat !== 10) {
-      this.emit({ type: 'error', message: `Unsupported FLV audio codec ${soundFormat}; G711 decode is TODO in no-video WebAudio path.` });
+      this.emit({ type: 'error', message: `Unsupported FLV audio codec ${soundFormat}; this parser supports AAC only.` });
       return;
     }
     const packetType = payload[1];

@@ -28,7 +28,7 @@ export function detectCapability(canvas?: HTMLCanvasElement, requireWebCodecs = 
   }
 
   const supported = webAudio && (!requireWebCodecs || (webCodecsVideo && webCodecsAudio));
-  const reason = supported ? undefined : 'This no-video path requires WebAudio and WebCodecs, or an enabled WASM decoder fallback.';
+  const reason = supported ? undefined : 'This playback route requires WebAudio and WebCodecs. Select the Jessibuca engine for supported FLV/WASM playback.';
   return { webCodecsVideo, webCodecsAudio, webAudio, webGL, wasm, supported, reason };
 }
 

@@ -1,151 +1,68 @@
-# Jessibuca open-source design study
+# Jessibuca Design Study
 
-This note records the design ideas Tesla-VideoPlayer can reuse without importing
-or copying Jessibuca runtime code.
+> Historical design note updated to reflect the current Tesla implementation.
+> For normative behavior, use `README.md`, `docs/api.md`, and
+> `docs/architecture.md`.
 
-## Player initialization
+## Reused ideas
 
-Jessibuca separates the public facade from the internal player. The facade
-validates the container, normalizes options, protects against duplicate
-instances on one container, creates the internal player, and re-emits internal
-events as public API events. The internal player then creates the video surface,
-audio graph, stream loader, demuxer, worker bridge, optional WebCodecs decoder,
-optional MSE decoder, controls, timers, and stats loop.
+Jessibuca's most useful design pattern is separation of concerns: a public
+facade owns lifecycle and user commands, while stream loading, demux, decode,
+render, audio, controls, timers, errors, and stats remain isolated.
+Tesla-VideoPlayer follows this split through `TeslaPlayer`, the Tesla WebCodecs
+engine, the active Worker protocol, render/audio modules, and optional controls.
 
-Tesla should keep the same high-level split: a small public class owns
-lifecycle and user commands, while stream fetch, demux, decode, render, audio,
-clock, stats, and errors stay in isolated modules.
+## FLV routes
 
-## Worker message protocol
+Both HTTP-FLV and WS-FLV are implemented.
 
-Jessibuca uses command-like messages between the main thread and decoder worker:
+- `decoderMode: "auto"` or `"wasm"` selects the vendored Jessibuca software
+  decoder.
+- `decoderMode: "webcodecs"` selects Tesla's FLV demux + WebCodecs path.
 
-- main to worker: init, decode, audioDecode, videoDecode, close, updateConfig.
-- worker to main: init, videoCode, audioCode, initVideo, initAudio, render,
-  playAudio, wasmError, and telemetry messages.
+The Tesla Worker parses FLV headers and tags, emits H.264/AAC configuration and
+samples, and leaves decoding to main-thread WebCodecs.
 
-The important pattern is a narrow protocol with explicit config, media samples,
-render/audio outputs, close, and error messages. Tesla uses typed messages in
-`src/worker/worker-protocol.ts` so the worker can be deleted or replaced without
-touching the player facade.
+## HLS and MP4 routes
 
-## HTTP-FLV and WS-FLV data flow
+Tesla owns these routes rather than delegating them to Jessibuca:
 
-Jessibuca chooses fetch for HTTP URLs and WebSocket for non-HTTP live URLs, then
-feeds byte chunks into the FLV demuxer. The FLV demuxer consumes the 9-byte FLV
-header, previous-tag-size fields, and tag headers, then dispatches audio tag 8
-and video tag 9 payloads downstream.
+- HLS media/master playlist parsing, AES-128, MPEG-TS demux, live polling, VOD
+  seek, and discontinuity reset;
+- progressive MP4 Range/stream loading, incremental MP4Box append/extraction,
+  and pull-credit backpressure.
 
-Tesla's standalone stage now implements HTTP-FLV and a minimal HLS path
-(`m3u8 -> TS -> H.264/AAC samples`). WS-FLV is left as a TODO.
+## Decode and rendering
 
-## Demux flow
+Tesla configures `VideoDecoder` and `AudioDecoder`, rejects stale async
+configuration by session generation, and bounds decoder input. Video renders to
+Canvas2D or WebGL; audio is copied into WebAudio buffers and scheduled against an
+AudioContext clock.
 
-Jessibuca's FLV path classifies tags and forwards payloads with timestamps. For
-H.264, the AVC packet header decides sequence-header versus frame data; for AAC,
-the AAC packet type decides AudioSpecificConfig versus raw AAC frame.
+No HTML `video` or MSE is used on the Tesla WebCodecs route.
 
-Tesla mirrors this design at the data-flow level: the worker parses FLV tags,
-emits `video-config`, `audio-config`, `video-sample`, and `audio-sample`
-messages, and never decodes in the worker for the WebCodecs path.
+## Buffering and frame dropping
 
-## WebCodecs decode flow
+The current implementation includes:
 
-Jessibuca configures `VideoDecoder` from the AVCDecoderConfigurationRecord
-inside the FLV sequence header, waits for the first keyframe after configure,
-and emits explicit errors for unsupported codecs, configure failures, decode
-failures, and size changes.
-
-Tesla configures `VideoDecoder` and `AudioDecoder` on the main thread. The first
-implementation supports H.264/AVC and AAC. H.265, G.711, and dynamic codec
-switches are TODO items instead of silent success.
-
-## WASM software fallback
-
-Jessibuca ships an FFmpeg-derived WASM decoder and can fall back from WebCodecs
-or MSE to WASM when configured. Its worker reports decoded YUV/PCM frames to the
-main thread.
-
-Tesla does not copy or depend on that WASM. The fallback plan is documented as a
-TODO: introduce a Tesla-owned decoder package with an explicit worker protocol
-that outputs decoded video frames or YUV planes and PCM blocks. Until that
-exists, WebCodecs absence is reported as an unsupported capability.
-
-## Canvas/WebGL rendering
-
-Jessibuca creates a canvas inside the player container. It chooses WebGL for
-YUV-plane rendering, bitmaprenderer for offscreen paths, or 2D canvas drawing
-for WebCodecs `VideoFrame`.
-
-Tesla provides both `CanvasRenderer` and `WebGLRenderer`. The WebGL renderer
-uploads `VideoFrame` directly as a texture for the WebCodecs path. The 2D
-renderer uses `drawImage`. Neither path uses a `video` element.
-
-## WebAudio playback
-
-Jessibuca owns an `AudioContext`, a `GainNode`, and an audio buffer queue. The
-WASM path feeds PCM through ScriptProcessor; WebCodecs/MSE paths avoid extra
-worker delay where possible.
-
-Tesla's `WebAudioPlayer` receives decoded `AudioData`, copies it into
-`AudioBuffer`, schedules it against an `AudioContext` clock, and exposes queued
-milliseconds for stats.
-
-## Audio/video sync
-
-Jessibuca tracks audio and video timestamps. In the WASM path it compares audio
-timestamp to video timestamp, waits if audio is too far ahead, and drops audio
-buffers if audio falls too far behind. Video buffering also derives delay from
-local wall time versus stream timestamp.
-
-Tesla uses audio as the primary clock when audio exists. Video frames are
-scheduled relative to the first audio timestamp; if audio is not configured yet,
-video uses a wall-clock fallback. Late video frames are dropped when they exceed
-the allowed lateness window.
-
-## Buffer queue design
-
-Jessibuca keeps demux queues and audio queues bounded, measures live delay, and
-enters a dropping mode when the stream exceeds the configured buffer plus delay
-window.
-
-Tesla keeps small decode queues in the main thread and exposes
-`videoQueueLength` and `audioQueueMs`. It drops late decoded frames and can later
-add a worker-side GOP drop mode once HTTP-FLV backpressure is tuned.
-
-## Frame dropping
-
-Jessibuca's demux layer drops until a keyframe when live delay is too high, then
-leaves dropping mode after delay returns under the buffer target.
-
-Tesla's initial stage drops decoded video frames that are too late relative to
-the audio clock. TODO: add pre-decode GOP dropping in the FLV worker so overloaded
-streams do less decode work.
+- bounded live compressed-video queue with keyframe restart;
+- `VideoDecoder.decodeQueueSize` and audio decode-queue gating;
+- bounded decode batches;
+- bounded render queue;
+- late decoded-frame dropping;
+- MP4 pull credit and Worker sample high-water mark;
+- WebAudio scheduled-duration limits.
 
 ## Errors and reconnect
 
-Jessibuca names errors for fetch, WebSocket, WebGL, MSE, WebCodecs configure,
-WebCodecs decode, WASM decode, stream end, loading timeout, and delay timeout.
-The facade can pause, reset, and replay on selected errors.
+Fatal WebCodecs-engine errors terminate the current generation before emitting
+an error. `TeslaPlayer` provides one reconnect policy for HTTP-FLV, WS-FLV, and
+HLS, with retry count and attempt-scaled delay options.
 
-Tesla emits typed error events and surfaces the message in the demo. Reconnect is
-documented as TODO in the first standalone chain; the worker supports stop/abort
-so reconnect can be added as a facade policy without changing demux internals.
+## Deliberately unsupported areas
 
-## Multi-instance playback
-
-Jessibuca prevents duplicate players on the same container and keeps player
-state, worker, renderer, audio graph, timers, and stats per instance.
-
-Tesla follows per-instance ownership. Each player creates its own canvas,
-renderer, audio context, decoder pair, worker, stats object, and event emitter.
-
-## Stats
-
-Jessibuca tracks fps, audio/video bitrate, current timestamp, buffer delay, and
-play-to-render milestone timings.
-
-Tesla's standalone stats include the required acceptance metrics:
-`decoderType`, `rendererType`, `videoTagCount`, `canvasCount`, `fps`,
-`decodedFrames`, `droppedFrames`, `audioQueueMs`, `videoQueueLength`,
-`firstFrameTimeMs`, and `currentTimeMs`.
+- HLS/MP4 WASM bridge;
+- HLS SAMPLE-AES and fMP4/CMAF;
+- Tesla WebCodecs G.711/Opus;
+- playback-rate control;
+- h265web.js without external runtime/WASM assets.

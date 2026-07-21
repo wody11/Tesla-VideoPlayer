@@ -31,4 +31,19 @@ two.ts
     });
     expect(parsed.segments[1].key?.method).toBe('NONE');
   });
+
+  it('marks only the segment following EXT-X-DISCONTINUITY', () => {
+    const parsed = parseM3U8(`#EXTM3U
+#EXT-X-MEDIA-SEQUENCE:10
+#EXTINF:4,
+one.ts
+#EXT-X-DISCONTINUITY
+#EXTINF:4,
+two.ts
+#EXTINF:4,
+three.ts`, 'https://media.example/live/index.m3u8');
+
+    expect(parsed.segments.map(segment => segment.discontinuity)).toEqual([undefined, true, undefined]);
+  });
+
 });
