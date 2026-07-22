@@ -24,6 +24,10 @@ export interface TeslaPlayerStats {
   audioScheduledSources: number;
   audioFrameSamples: number;
   audioContextState: string;
+  audioTimelineResets: number;
+  audioUnderruns: number;
+  audioStartupBufferMs: number;
+  audioDroppedSamples: number;
   videoQueueLength: number;
   currentTime: number;
   currentTimeMs: number;
@@ -55,6 +59,10 @@ function createInitialStats(): TeslaPlayerStats {
     audioScheduledSources: 0,
     audioFrameSamples: 0,
     audioContextState: 'closed',
+    audioTimelineResets: 0,
+    audioUnderruns: 0,
+    audioStartupBufferMs: 0,
+    audioDroppedSamples: 0,
     videoQueueLength: 0,
     currentTime: 0,
     currentTimeMs: 0,
@@ -104,6 +112,10 @@ export class PlayerStatsTracker {
 
   markDropped(): void {
     this.stats.droppedFrames += 1;
+  }
+
+  markAudioDropped(count = 1): void {
+    this.stats.audioDroppedSamples += Math.max(0, Math.floor(count));
   }
 
   markRendered(): void {

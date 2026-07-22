@@ -46,3 +46,45 @@ export function trimLiveVideoQueue<T extends VideoSampleLike>(queue: T[], maxSiz
   queue.splice(0, keepFrom);
   return dropped;
 }
+
+export interface TimestampedSampleLike {
+  timestamp: number;
+  duration?: number;
+}
+
+export function trimLiveAudioQueue<T extends TimestampedSampleLike>(queue: T[], maxDurationUs: number, maxSamples = 512): number {
+  const durationLimit = Math.max(100_000, Number(maxDurationUs) || 2_000_000);
+  const sampleLimit = Math.max(8, Math.floor(maxSamples));
+  if (queue.length <= sampleLimit) {
+    const first = queue[0];
+    const last = queue[queue.length - 1];
+    if (!first || !last || last.timestamp - first.timestamp <= durationLimit) return 0;
+  }
+
+  let keepFrom = queue.length - 1;
+  const newest = queue[queue.length - 1]?.timestamp || 0;
+  while (keepFrom > 0) {
+    const span = newest - queue[keepFrom - 1].timestamp;
+    if (queue.length - keepFrom >= sampleLimit || span > durationLimit) break;
+    keepFrom -= 1;
+  }
+  const dropped = keepFrom;
+  if (dropped > 0) queue.splice(0, dropped);
+  return dropped;
+}
+
+export function insertByTimestamp<T extends { timestamp: number }>(queue: T[], item: T): void {
+  const last = queue[queue.length - 1];
+  if (!last || last.timestamp <= item.timestamp) {
+    queue.push(item);
+    return;
+  }
+  let low = 0;
+  let high = queue.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (queue[middle].timestamp <= item.timestamp) low = middle + 1;
+    else high = middle;
+  }
+  queue.splice(low, 0, item);
+}

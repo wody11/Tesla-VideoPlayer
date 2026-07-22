@@ -1,4 +1,4 @@
-export { d as decodePesTimestamp, a as demuxTS } from './demux-ts-6eb45a7f.js';
+export { d as decodePesTimestamp, a as demuxTS } from './demux-ts-ce1f394e.js';
 
 /*
  * Tesla-VideoPlayer is based on Jessibuca open source architecture.
@@ -81,6 +81,10 @@ function createInitialStats() {
         audioScheduledSources: 0,
         audioFrameSamples: 0,
         audioContextState: 'closed',
+        audioTimelineResets: 0,
+        audioUnderruns: 0,
+        audioStartupBufferMs: 0,
+        audioDroppedSamples: 0,
         videoQueueLength: 0,
         currentTime: 0,
         currentTimeMs: 0,
@@ -124,6 +128,9 @@ class PlayerStatsTracker {
     markDropped() {
         this.stats.droppedFrames += 1;
     }
+    markAudioDropped(count = 1) {
+        this.stats.audioDroppedSamples += Math.max(0, Math.floor(count));
+    }
     markRendered() {
         this.frameTicks += 1;
         const current = now();
@@ -160,7 +167,10 @@ const DEFAULT_PLAYER_OPTIONS = {
     volume: 1,
     reconnect: true,
     reconnectMaxRetries: 3,
-    reconnectDelayMs: 1000
+    reconnectDelayMs: 1000,
+    responsive: true,
+    aspectRatio: 'video',
+    maxViewportHeightRatio: 1
 };
 function normalizePlayerOptions(options) {
     return {
@@ -168,8 +178,17 @@ function normalizePlayerOptions(options) {
         ...options,
         volume: clamp(Number(options.volume ?? DEFAULT_PLAYER_OPTIONS.volume), 0, 1),
         reconnectMaxRetries: Math.max(0, Math.floor(Number(options.reconnectMaxRetries ?? DEFAULT_PLAYER_OPTIONS.reconnectMaxRetries))),
-        reconnectDelayMs: Math.max(100, Math.floor(Number(options.reconnectDelayMs ?? DEFAULT_PLAYER_OPTIONS.reconnectDelayMs)))
+        reconnectDelayMs: Math.max(100, Math.floor(Number(options.reconnectDelayMs ?? DEFAULT_PLAYER_OPTIONS.reconnectDelayMs))),
+        responsive: options.responsive !== false,
+        aspectRatio: normalizeAspectRatio(options.aspectRatio ?? DEFAULT_PLAYER_OPTIONS.aspectRatio),
+        maxViewportHeightRatio: clamp(Number(options.maxViewportHeightRatio ?? DEFAULT_PLAYER_OPTIONS.maxViewportHeightRatio), 0.25, 1)
     };
+}
+function normalizeAspectRatio(value) {
+    if (value === 'video')
+        return value;
+    const numeric = Number(value);
+    return Number.isFinite(numeric) && numeric > 0 ? numeric : 16 / 9;
 }
 function clamp(value, min, max) {
     return Number.isFinite(value) ? Math.max(min, Math.min(max, value)) : min;
@@ -235,24 +254,53 @@ class AudioClock {
     }
 }
 
+function deriveAudioStartupBufferMs(maxQueueMs) {
+    const normalized = Math.max(300, Math.min(5000, Number(maxQueueMs) || 1500));
+    return Math.round(Math.max(80, Math.min(260, normalized * 0.12)));
+}
+function decideAudioTimelineReset(input) {
+    const maxQueueMs = Math.max(300, Number(input.maxQueueMs) || 1500);
+    if (input.queuedMs > Math.max(maxQueueMs * 1.6, maxQueueMs + 800))
+        return 'backlog';
+    if (input.hasStarted && Math.abs(input.mediaGapMs) > 160)
+        return 'timestamp-gap';
+    if (input.hasStarted && input.queuedMs < -25)
+        return 'underrun';
+    return 'none';
+}
+function calculateAudioStartTime(nowSeconds, scheduledUntilSeconds, startupBufferMs, startsNewTimeline) {
+    const now = Math.max(0, Number(nowSeconds) || 0);
+    const scheduledUntil = Math.max(0, Number(scheduledUntilSeconds) || 0);
+    const leadSeconds = Math.max(0.015, (Math.max(0, Number(startupBufferMs) || 0)) / 1000);
+    const timelineTarget = startsNewTimeline
+        ? Math.max(scheduledUntil, now + leadSeconds)
+        : scheduledUntil;
+    return Math.max(now + 0.015, timelineTarget);
+}
+
 // Schedules decoded AudioData through WebAudio without using media elements.
 class WebAudioPlayer {
-    constructor() {
+    constructor(options = {}) {
         this.clock = new AudioClock();
         this.scheduledUntil = 0;
         this.sources = new Set();
-        this.targetQueueMs = 1500;
-        this.hardResetQueueMs = 7000;
+        this.maxQueueMs = 1500;
+        this.startupBufferMs = 180;
         this.enqueuedFrames = 0;
         this.lastFrameSamples = 0;
         this.lastTimestampUs = 0;
+        this.timelineResetCount = 0;
+        this.underrunCount = 0;
+        this.volume = 1;
+        this.fadeSeconds = 0.012;
         const Ctor = window.AudioContext || window.webkitAudioContext;
         if (!Ctor)
             throw new Error('WebAudio is not available.');
-        this.context = new Ctor();
+        this.context = new Ctor({ latencyHint: options.latencyHint || 'balanced' });
         this.gain = this.context.createGain();
         this.gain.gain.value = 1;
         this.gain.connect(this.context.destination);
+        this.setMaxQueueMs(options.maxQueueMs ?? 1500);
     }
     async resume() {
         if (this.context.state !== 'running')
@@ -262,54 +310,77 @@ class WebAudioPlayer {
         this.context.suspend().catch(() => undefined);
     }
     setVolume(value) {
-        const volume = Math.max(0, Math.min(1, Number(value) || 0));
-        this.gain.gain.setValueAtTime(volume, this.context.currentTime);
+        this.volume = Math.max(0, Math.min(1, Number(value) || 0));
+        const now = this.context.currentTime;
+        const param = this.gain.gain;
+        this.holdGainAt(now);
+        param.linearRampToValueAtTime(this.volume, now + this.fadeSeconds);
     }
     setMaxQueueMs(value) {
-        this.targetQueueMs = Math.max(300, Math.min(5000, Number(value) || 1500));
-        this.hardResetQueueMs = Math.max(this.targetQueueMs * 2, this.targetQueueMs + 1000);
+        this.maxQueueMs = Math.max(300, Math.min(5000, Number(value) || 1500));
+        this.startupBufferMs = deriveAudioStartupBufferMs(this.maxQueueMs);
     }
     enqueue(frame) {
         if (this.context.state !== 'running')
             this.context.resume().catch(() => undefined);
-        const channels = frame.numberOfChannels || 2;
-        const frames = frame.numberOfFrames || 0;
-        const sampleRate = frame.sampleRate || this.context.sampleRate;
+        const channels = Math.max(1, frame.numberOfChannels || 2);
+        const frames = Math.max(0, frame.numberOfFrames || 0);
+        const sampleRate = Math.max(1, frame.sampleRate || this.context.sampleRate);
         const timestamp = typeof frame.timestamp === 'number' ? frame.timestamp : 0;
+        if (!frames)
+            return;
         this.enqueuedFrames += 1;
         this.lastFrameSamples = frames;
         this.lastTimestampUs = timestamp;
-        if (this.queuedMs() > this.hardResetQueueMs) {
-            this.stopScheduledSources();
-            this.clock.reset();
-            this.scheduledUntil = this.context.currentTime + this.targetQueueMs / 1000;
+        const durationUs = (frames / sampleRate) * 1000000;
+        const mediaGapMs = this.expectedNextTimestampUs === undefined
+            ? 0
+            : (timestamp - this.expectedNextTimestampUs) / 1000;
+        const rawQueueMs = (this.scheduledUntil - this.context.currentTime) * 1000;
+        const resetReason = decideAudioTimelineReset({
+            queuedMs: rawQueueMs,
+            mediaGapMs,
+            maxQueueMs: this.maxQueueMs,
+            hasStarted: this.expectedNextTimestampUs !== undefined
+        });
+        if (resetReason !== 'none') {
+            if (resetReason === 'underrun')
+                this.underrunCount += 1;
+            this.smoothTimelineReset();
         }
-        this.clock.bind(timestamp, Math.max(this.context.currentTime + this.targetQueueMs / 1000, this.scheduledUntil || 0));
+        const startsNewTimeline = this.expectedNextTimestampUs === undefined;
         const audioBuffer = this.context.createBuffer(channels, frames, sampleRate);
-        for (let ch = 0; ch < channels; ch++) {
+        for (let channel = 0; channel < channels; channel += 1) {
             const data = new Float32Array(frames);
             try {
-                frame.copyTo(data, { planeIndex: ch });
+                frame.copyTo(data, { planeIndex: channel, format: 'f32-planar' });
             }
             catch {
-                frame.copyTo(data);
+                frame.copyTo(data, { planeIndex: channel });
             }
-            audioBuffer.copyToChannel(data, ch);
+            audioBuffer.copyToChannel(data, channel);
+        }
+        const now = this.context.currentTime;
+        const when = calculateAudioStartTime(now, this.scheduledUntil, this.startupBufferMs, startsNewTimeline);
+        if (startsNewTimeline) {
+            this.clock.reset();
+            this.clock.bind(timestamp, when);
+            this.fadeInAt(when);
         }
         const source = this.context.createBufferSource();
         source.buffer = audioBuffer;
-        const queueMs = this.queuedMs();
-        const catchupRate = queueMs > this.targetQueueMs
-            ? Math.min(1.12, 1 + ((queueMs - this.targetQueueMs) / Math.max(this.targetQueueMs, 1)) * 0.06)
-            : 1;
-        source.playbackRate.setValueAtTime(catchupRate, this.context.currentTime);
         source.connect(this.gain);
-        const target = this.clock.targetContextTime(timestamp);
-        const when = Math.max(this.context.currentTime + 0.01, target ?? this.scheduledUntil ?? this.context.currentTime);
         source.start(when);
-        this.scheduledUntil = Math.max(this.scheduledUntil, when + audioBuffer.duration / catchupRate);
+        this.scheduledUntil = when + audioBuffer.duration;
+        this.expectedNextTimestampUs = timestamp + durationUs;
         this.sources.add(source);
-        source.onended = () => this.sources.delete(source);
+        source.onended = () => {
+            this.sources.delete(source);
+            try {
+                source.disconnect();
+            }
+            catch { }
+        };
     }
     queuedMs() {
         return Math.max(0, (this.scheduledUntil - this.context.currentTime) * 1000);
@@ -333,29 +404,79 @@ class WebAudioPlayer {
             enqueuedFrames: this.enqueuedFrames,
             scheduledSources: this.sources.size,
             lastFrameSamples: this.lastFrameSamples,
-            lastTimestampUs: this.lastTimestampUs
+            lastTimestampUs: this.lastTimestampUs,
+            timelineResetCount: this.timelineResetCount,
+            underrunCount: this.underrunCount,
+            startupBufferMs: this.startupBufferMs
         };
     }
-    reset() {
-        this.stopScheduledSources();
+    reset(smooth = true) {
+        const now = this.context.currentTime;
+        if (smooth && this.sources.size > 0 && this.context.state !== 'closed') {
+            const fadeOutAt = now + this.fadeSeconds;
+            const fadeInAt = fadeOutAt + this.fadeSeconds;
+            const param = this.gain.gain;
+            this.holdGainAt(now);
+            param.linearRampToValueAtTime(0, fadeOutAt);
+            this.stopScheduledSources(fadeOutAt);
+            param.setValueAtTime(0, fadeOutAt);
+            param.linearRampToValueAtTime(this.volume, fadeInAt);
+            this.scheduledUntil = fadeInAt;
+            this.timelineResetCount += 1;
+        }
+        else {
+            this.stopScheduledSources(now);
+            this.scheduledUntil = now;
+        }
         this.clock.reset();
-        this.scheduledUntil = this.context.currentTime;
+        this.expectedNextTimestampUs = undefined;
         this.enqueuedFrames = 0;
         this.lastFrameSamples = 0;
         this.lastTimestampUs = 0;
     }
     close() {
-        this.reset();
+        this.reset(false);
         this.context.close().catch(() => undefined);
     }
-    stopScheduledSources() {
-        for (const source of this.sources) {
+    smoothTimelineReset() {
+        const now = this.context.currentTime;
+        const fadeOutAt = now + this.fadeSeconds;
+        const fadeInAt = fadeOutAt + this.fadeSeconds;
+        const param = this.gain.gain;
+        this.holdGainAt(now);
+        param.linearRampToValueAtTime(0, fadeOutAt);
+        this.stopScheduledSources(fadeOutAt);
+        param.setValueAtTime(0, fadeOutAt);
+        param.linearRampToValueAtTime(this.volume, fadeInAt);
+        this.clock.reset();
+        this.scheduledUntil = fadeInAt + this.startupBufferMs / 1000;
+        this.expectedNextTimestampUs = undefined;
+        this.timelineResetCount += 1;
+    }
+    fadeInAt(time) {
+        const param = this.gain.gain;
+        param.cancelScheduledValues(time);
+        param.setValueAtTime(0, time);
+        param.linearRampToValueAtTime(this.volume, time + this.fadeSeconds);
+    }
+    holdGainAt(time) {
+        const param = this.gain.gain;
+        const hold = param.cancelAndHoldAtTime;
+        if (typeof hold === 'function') {
             try {
-                source.stop();
+                hold.call(param, time);
+                return;
             }
             catch { }
+        }
+        const value = param.value;
+        param.cancelScheduledValues(time);
+        param.setValueAtTime(value, time);
+    }
+    stopScheduledSources(stopAt) {
+        for (const source of this.sources) {
             try {
-                source.disconnect();
+                source.stop(stopAt);
             }
             catch { }
         }
@@ -509,13 +630,30 @@ class WebGLRenderer {
         this.type = 'webgl';
         this.texture = null;
         this.program = null;
+        this.vertexShader = null;
+        this.fragmentShader = null;
+        this.vertexBuffer = null;
+        this.contextLost = false;
+        this.handleContextLost = (event) => {
+            event.preventDefault();
+            this.contextLost = true;
+        };
+        this.handleContextRestored = () => {
+            this.contextLost = false;
+            this.releaseResources();
+            this.init();
+        };
         const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
         if (!gl)
             throw new Error('WebGL context is not available.');
         this.gl = gl;
+        this.canvas.addEventListener('webglcontextlost', this.handleContextLost);
+        this.canvas.addEventListener('webglcontextrestored', this.handleContextRestored);
         this.init();
     }
     draw(frame) {
+        if (this.contextLost || !this.program || !this.texture)
+            return;
         const width = frame.displayWidth || frame.codedWidth;
         const height = frame.displayHeight || frame.codedHeight;
         if (width && height && (this.canvas.width !== width || this.canvas.height !== height)) {
@@ -525,21 +663,39 @@ class WebGLRenderer {
         const gl = this.gl;
         gl.viewport(0, 0, this.canvas.width, this.canvas.height);
         gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.useProgram(this.program);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.vertexBuffer);
         gl.bindTexture(gl.TEXTURE_2D, this.texture);
         gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 1);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame);
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     }
     clear() {
-        this.gl.clear(this.gl.COLOR_BUFFER_BIT);
+        if (!this.contextLost)
+            this.gl.clear(this.gl.COLOR_BUFFER_BIT);
     }
     destroy() {
+        this.canvas.removeEventListener('webglcontextlost', this.handleContextLost);
+        this.canvas.removeEventListener('webglcontextrestored', this.handleContextRestored);
+        this.releaseResources();
+    }
+    releaseResources() {
+        const gl = this.gl;
         if (this.texture)
-            this.gl.deleteTexture(this.texture);
+            gl.deleteTexture(this.texture);
+        if (this.vertexBuffer)
+            gl.deleteBuffer(this.vertexBuffer);
         if (this.program)
-            this.gl.deleteProgram(this.program);
+            gl.deleteProgram(this.program);
+        if (this.vertexShader)
+            gl.deleteShader(this.vertexShader);
+        if (this.fragmentShader)
+            gl.deleteShader(this.fragmentShader);
         this.texture = null;
+        this.vertexBuffer = null;
         this.program = null;
+        this.vertexShader = null;
+        this.fragmentShader = null;
     }
     init() {
         const gl = this.gl;
@@ -557,6 +713,8 @@ class WebGLRenderer {
         ].join('\n');
         const vertex = this.compile(gl.VERTEX_SHADER, vertexSource);
         const fragment = this.compile(gl.FRAGMENT_SHADER, fragmentSource);
+        this.vertexShader = vertex;
+        this.fragmentShader = fragment;
         const program = gl.createProgram();
         if (!program)
             throw new Error('Failed to create WebGL program.');
@@ -564,7 +722,9 @@ class WebGLRenderer {
         gl.attachShader(program, fragment);
         gl.linkProgram(program);
         if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-            throw new Error(gl.getProgramInfoLog(program) || 'Failed to link WebGL program.');
+            const error = gl.getProgramInfoLog(program) || 'Failed to link WebGL program.';
+            gl.deleteProgram(program);
+            throw new Error(error);
         }
         gl.useProgram(program);
         this.program = program;
@@ -575,6 +735,9 @@ class WebGLRenderer {
             1, 1, 1, 1
         ]);
         const buffer = gl.createBuffer();
+        if (!buffer)
+            throw new Error('Failed to create WebGL vertex buffer.');
+        this.vertexBuffer = buffer;
         gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
         gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
         const pos = gl.getAttribLocation(program, 'a_pos');
@@ -584,6 +747,8 @@ class WebGLRenderer {
         gl.enableVertexAttribArray(uv);
         gl.vertexAttribPointer(uv, 2, gl.FLOAT, false, 16, 8);
         this.texture = gl.createTexture();
+        if (!this.texture)
+            throw new Error('Failed to create WebGL texture.');
         gl.bindTexture(gl.TEXTURE_2D, this.texture);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
@@ -598,7 +763,9 @@ class WebGLRenderer {
         this.gl.shaderSource(shader, source);
         this.gl.compileShader(shader);
         if (!this.gl.getShaderParameter(shader, this.gl.COMPILE_STATUS)) {
-            throw new Error(this.gl.getShaderInfoLog(shader) || 'Failed to compile WebGL shader.');
+            const error = this.gl.getShaderInfoLog(shader) || 'Failed to compile WebGL shader.';
+            this.gl.deleteShader(shader);
+            throw new Error(error);
         }
         return shader;
     }
@@ -717,6 +884,45 @@ function trimLiveVideoQueue(queue, maxSize) {
     queue.splice(0, keepFrom);
     return dropped;
 }
+function trimLiveAudioQueue(queue, maxDurationUs, maxSamples = 512) {
+    const durationLimit = Math.max(100000, Number(maxDurationUs) || 2000000);
+    const sampleLimit = Math.max(8, Math.floor(maxSamples));
+    if (queue.length <= sampleLimit) {
+        const first = queue[0];
+        const last = queue[queue.length - 1];
+        if (!first || !last || last.timestamp - first.timestamp <= durationLimit)
+            return 0;
+    }
+    let keepFrom = queue.length - 1;
+    const newest = queue[queue.length - 1]?.timestamp || 0;
+    while (keepFrom > 0) {
+        const span = newest - queue[keepFrom - 1].timestamp;
+        if (queue.length - keepFrom >= sampleLimit || span > durationLimit)
+            break;
+        keepFrom -= 1;
+    }
+    const dropped = keepFrom;
+    if (dropped > 0)
+        queue.splice(0, dropped);
+    return dropped;
+}
+function insertByTimestamp(queue, item) {
+    const last = queue[queue.length - 1];
+    if (!last || last.timestamp <= item.timestamp) {
+        queue.push(item);
+        return;
+    }
+    let low = 0;
+    let high = queue.length;
+    while (low < high) {
+        const middle = (low + high) >>> 1;
+        if (queue[middle].timestamp <= item.timestamp)
+            low = middle + 1;
+        else
+            high = middle;
+    }
+    queue.splice(low, 0, item);
+}
 
 class HlsWebCodecsEngine {
     constructor(options) {
@@ -738,6 +944,8 @@ class HlsWebCodecsEngine {
         this.seenKeyFrame = false;
         this.pendingVideoSamples = [];
         this.pendingAudioSamples = [];
+        this.videoWidth = 0;
+        this.videoHeight = 0;
         this.renderQueue = [];
         this.settings = {
             fitMode: 'contain',
@@ -796,9 +1004,11 @@ class HlsWebCodecsEngine {
             throw error;
         }
         try {
-            const audio = new WebAudioPlayer();
+            const audio = new WebAudioPlayer({
+                maxQueueMs: this.settings.audioMaxQueueMs,
+                latencyHint: audioLatencyHint(this.settings.preset)
+            });
             this.audio = audio;
-            audio.setMaxQueueMs(this.settings.audioMaxQueueMs);
             audio.resume().catch(error => {
                 if (this.sessions.isCurrent(sessionId)) {
                     this.events.emit('log', `AudioContext resume is pending or blocked: ${error?.message || error}`);
@@ -884,15 +1094,19 @@ class HlsWebCodecsEngine {
     }
     getStats() {
         const audioDiagnostics = this.audio?.diagnostics();
+        const currentTimeMs = this.currentMediaTimeMs();
         this.stats.patch({
             audioQueueMs: this.audio?.queuedMs() || 0,
             audioDecodedFrames: audioDiagnostics?.enqueuedFrames || 0,
             audioScheduledSources: audioDiagnostics?.scheduledSources || 0,
             audioFrameSamples: audioDiagnostics?.lastFrameSamples || 0,
             audioContextState: audioDiagnostics?.contextState || 'closed',
+            audioTimelineResets: audioDiagnostics?.timelineResetCount || 0,
+            audioUnderruns: audioDiagnostics?.underrunCount || 0,
+            audioStartupBufferMs: audioDiagnostics?.startupBufferMs || 0,
             videoQueueLength: this.videoQueueLength,
-            currentTimeMs: this.audio?.currentTimeMs() || 0,
-            currentTime: (this.audio?.currentTimeMs() || 0) / 1000
+            currentTimeMs,
+            currentTime: currentTimeMs / 1000
         });
         return this.stats.snapshot();
     }
@@ -962,6 +1176,8 @@ class HlsWebCodecsEngine {
         this.videoQueueLength = 0;
         this.videoWallClockBaseUs = undefined;
         this.videoWallClockBaseMs = undefined;
+        this.videoWidth = 0;
+        this.videoHeight = 0;
         this.clearDecodePump();
         this.clearRenderQueue();
         this.stats.markDiscontinuity();
@@ -1036,6 +1252,11 @@ class HlsWebCodecsEngine {
                 if (this.sourceType === 'mp4')
                     this.mp4PullOutstanding = Math.max(0, this.mp4PullOutstanding - 1);
                 this.pendingAudioSamples.push(message);
+                if (this.sourceType !== 'mp4') {
+                    const dropped = trimLiveAudioQueue(this.pendingAudioSamples, this.settings.audioMaxQueueMs * 2000, 512);
+                    if (dropped > 0)
+                        this.stats.markAudioDropped(dropped);
+                }
                 if (this.audioConfigured)
                     this.ensureDecodePump(sessionId);
             }
@@ -1066,9 +1287,15 @@ class HlsWebCodecsEngine {
             this.videoWallClockBaseUs = timestamp;
             this.videoWallClockBaseMs = performance.now();
         }
+        const width = frame.displayWidth || frame.codedWidth || 0;
+        const height = frame.displayHeight || frame.codedHeight || 0;
+        if (width > 0 && height > 0 && (width !== this.videoWidth || height !== this.videoHeight)) {
+            this.videoWidth = width;
+            this.videoHeight = height;
+            this.events.emit('videoSize', { width, height, aspectRatio: width / height });
+        }
         this.stats.markDecoded();
-        this.renderQueue.push({ frame, timestamp });
-        this.renderQueue.sort((a, b) => a.timestamp - b.timestamp);
+        insertByTimestamp(this.renderQueue, { frame, timestamp });
         while (this.renderQueue.length > this.settings.maxRenderQueue) {
             const old = this.renderQueue.shift();
             try {
@@ -1110,7 +1337,7 @@ class HlsWebCodecsEngine {
     ensureRenderLoop(sessionId = this.sessions.current) {
         if (!this.sessions.isCurrent(sessionId) || this.renderLoopId !== undefined)
             return;
-        this.renderLoopId = window.setTimeout(() => this.renderTick(sessionId), 8);
+        this.renderLoopId = requestRenderFrame(() => this.renderTick(sessionId));
     }
     ensureDecodePump(sessionId = this.sessions.current, delayMs = 0) {
         if (!this.sessions.isCurrent(sessionId) || this.decodePumpId !== undefined)
@@ -1131,7 +1358,7 @@ class HlsWebCodecsEngine {
         // a live segment leaves a persistent video backlog.
         let audioBudget = Math.max(4, this.settings.decodeBatchSize * 2);
         while (this.audioConfigured && audioBudget > 0 && this.pendingAudioSamples.length > 0
-            && (this.audio?.queuedMs() || 0) < this.settings.audioMaxQueueMs * 1.25
+            && (this.audio?.queuedMs() || 0) < this.settings.audioMaxQueueMs
             && (this.decoder?.audioDecodeQueueSize() || 0) < 32) {
             this.decoder?.decodeAudio(this.pendingAudioSamples.shift());
             audioBudget -= 1;
@@ -1139,7 +1366,7 @@ class HlsWebCodecsEngine {
         this.ensureMp4Pull();
         const videoCanContinue = canDecodeVideo(this.videoConfigured, this.pendingVideoSamples.length, this.renderQueue.length, this.decoder?.videoDecodeQueueSize() || 0, this.settings.maxRenderQueue);
         const audioCanContinue = this.audioConfigured && this.pendingAudioSamples.length > 0
-            && (this.audio?.queuedMs() || 0) < this.settings.audioMaxQueueMs * 1.25
+            && (this.audio?.queuedMs() || 0) < this.settings.audioMaxQueueMs
             && (this.decoder?.audioDecodeQueueSize() || 0) < 32;
         if (videoCanContinue || audioCanContinue) {
             this.ensureDecodePump(sessionId);
@@ -1186,6 +1413,15 @@ class HlsWebCodecsEngine {
         if (this.renderQueue.length > 0)
             this.ensureRenderLoop(sessionId);
         this.ensureMp4Pull();
+    }
+    currentMediaTimeMs() {
+        const audioTime = this.audio?.currentTimeMs();
+        if (audioTime && audioTime > 0)
+            return audioTime;
+        if (this.videoWallClockBaseUs !== undefined && this.videoWallClockBaseMs !== undefined) {
+            return Math.max(0, (this.videoWallClockBaseUs / 1000) + (performance.now() - this.videoWallClockBaseMs));
+        }
+        return 0;
     }
     videoDelayMs(timestamp) {
         const audioDelay = this.audioConfigured ? this.audio?.delayUntilMediaTimeMs(timestamp) : undefined;
@@ -1244,6 +1480,8 @@ class HlsWebCodecsEngine {
         this.mp4PullOutstanding = 0;
         this.videoWallClockBaseUs = undefined;
         this.videoWallClockBaseMs = undefined;
+        this.videoWidth = 0;
+        this.videoHeight = 0;
         this.clearDecodePump();
         this.clearRenderQueue();
         try {
@@ -1253,7 +1491,7 @@ class HlsWebCodecsEngine {
     }
     clearRenderQueue() {
         if (this.renderLoopId !== undefined) {
-            clearTimeout(this.renderLoopId);
+            cancelRenderFrame(this.renderLoopId);
             this.renderLoopId = undefined;
         }
         for (const item of this.renderQueue) {
@@ -1281,6 +1519,24 @@ class HlsWebCodecsEngine {
         this.worker.postMessage({ type: 'pull', count });
     }
 }
+function audioLatencyHint(preset) {
+    if (preset === 'low-latency')
+        return 'interactive';
+    if (preset === 'smooth')
+        return 'playback';
+    return 'balanced';
+}
+function requestRenderFrame(callback) {
+    if (typeof window.requestAnimationFrame === 'function')
+        return window.requestAnimationFrame(callback);
+    return window.setTimeout(() => callback(performance.now()), 16);
+}
+function cancelRenderFrame(id) {
+    if (typeof window.cancelAnimationFrame === 'function')
+        window.cancelAnimationFrame(id);
+    else
+        clearTimeout(id);
+}
 
 /*
  * h265web.js integration layer.
@@ -1295,17 +1551,32 @@ let h265webLoader;
 function loadScript(url) {
     if (window.new265webjs)
         return Promise.resolve();
-    if (h265webLoader)
-        return h265webLoader;
-    h265webLoader = new Promise((resolve, reject) => {
+    if (h265webLoader?.url === url)
+        return h265webLoader.promise;
+    const promise = new Promise((resolve, reject) => {
         const script = document.createElement('script');
         script.src = url;
         script.async = true;
-        script.onload = () => window.new265webjs ? resolve() : reject(new Error('h265web.js loaded but window.new265webjs is missing.'));
-        script.onerror = () => reject(new Error(`Failed to load h265web.js runtime: ${url}. Expected vendored asset dist/h265webjs.js is missing.`));
+        script.onload = () => {
+            if (window.new265webjs)
+                resolve();
+            else {
+                script.remove();
+                reject(new Error('h265web.js loaded but window.new265webjs is missing.'));
+            }
+        };
+        script.onerror = () => {
+            script.remove();
+            reject(new Error(`Failed to load h265web.js runtime: ${url}. Expected vendored asset dist/h265webjs.js is missing.`));
+        };
         document.head.appendChild(script);
+    }).catch(error => {
+        if (h265webLoader?.url === url)
+            h265webLoader = undefined;
+        throw error;
     });
-    return h265webLoader;
+    h265webLoader = { url, promise };
+    return promise;
 }
 class H265WebEngine {
     constructor(container, options) {
@@ -1331,6 +1602,7 @@ class H265WebEngine {
         this.instance.play?.();
     }
     pause() { this.instance?.pause?.(); }
+    resume() { this.instance?.play?.(); }
     stop() { this.instance?.pause?.(); }
     destroy() {
         this.instance?.release?.();
@@ -1353,68 +1625,359 @@ function resolveEngineRoute(sourceType, decoderMode = 'auto', enableH265Web = fa
     return 'unsupported';
 }
 
-function createFullscreenControl(player) {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.textContent = 'Fullscreen';
-    button.onclick = () => player.fullscreen();
-    return button;
+const STYLE_ID = 'tesla-player-control-styles';
+function formatPlayerTime(seconds) {
+    const value = Math.max(0, Math.floor(Number(seconds) || 0));
+    const hours = Math.floor(value / 3600);
+    const minutes = Math.floor((value % 3600) / 60);
+    const secs = value % 60;
+    return hours > 0
+        ? `${hours}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`
+        : `${minutes}:${String(secs).padStart(2, '0')}`;
 }
-
-function createPlayButton(player) {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.textContent = 'Play';
-    button.onclick = () => player.play().catch(error => player.events.emit('error', error));
-    return button;
-}
-
-function createScreenshotControl(player) {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.textContent = 'Shot';
-    button.onclick = () => {
-        const url = player.screenshot();
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = `tesla-frame-${Date.now()}.png`;
-        link.click();
-    };
-    return button;
-}
-
-function createVolumeControl(player) {
-    const input = document.createElement('input');
-    input.type = 'range';
-    input.min = '0';
-    input.max = '1';
-    input.step = '0.01';
-    input.value = '1';
-    input.oninput = () => player.setVolume(Number(input.value));
-    return input;
-}
-
-/*
- * Lightweight Jessibuca-style control bar for Tesla no-video player.
- */
 class ControlBar {
     constructor(player) {
         this.player = player;
+        this.previousVolume = 1;
+        this.scrubbing = false;
+        this.handleKeyDown = (event) => {
+            const target = event.target;
+            if (target?.tagName === 'INPUT' || target?.tagName === 'BUTTON')
+                return;
+            const key = event.key.toLowerCase();
+            if (key === ' ' || key === 'k') {
+                event.preventDefault();
+                this.player.togglePlayback().catch(error => this.player.events.emit('error', error));
+            }
+            else if (key === 'm') {
+                event.preventDefault();
+                this.toggleMute();
+            }
+            else if (key === 'f') {
+                event.preventDefault();
+                this.player.fullscreen();
+            }
+            else if (key === 'arrowleft' || key === 'arrowright') {
+                const stats = this.player.getStats();
+                if (stats.duration > 0) {
+                    event.preventDefault();
+                    const offset = key === 'arrowleft' ? -5 : 5;
+                    this.player.seek(Math.max(0, Math.min(stats.duration, stats.currentTime + offset)));
+                }
+            }
+            this.showTemporarily();
+        };
+        this.handleDoubleClick = (event) => {
+            if (event.target?.closest('.tesla-control-bar'))
+                return;
+            this.player.fullscreen();
+        };
+        this.showTemporarily = () => {
+            this.show();
+            if (this.player.getState() === 'playing')
+                this.scheduleHide();
+        };
+        ensureStyles();
+        this.container = player.getContainer();
+        this.originalTabIndex = this.container.getAttribute('tabindex');
         this.element = document.createElement('div');
         this.element.className = 'tesla-control-bar';
-        this.element.style.cssText = 'position:absolute;left:0;right:0;bottom:0;z-index:20;display:flex;gap:8px;align-items:center;padding:8px;background:rgba(17,17,17,.85);color:#fff;';
-        const pause = document.createElement('button');
-        pause.type = 'button';
-        pause.textContent = 'Pause';
-        pause.onclick = () => this.player.pause();
-        const stop = document.createElement('button');
-        stop.type = 'button';
-        stop.textContent = 'Stop';
-        stop.onclick = () => this.player.stop();
-        this.element.append(createPlayButton(player), pause, stop, createVolumeControl(player), createFullscreenControl(player), createScreenshotControl(player));
+        this.element.setAttribute('role', 'group');
+        this.element.setAttribute('aria-label', 'Video controls');
+        this.stateLabel = document.createElement('span');
+        this.stateLabel.className = 'tesla-control-state';
+        this.playButton = button('▶', '播放 / 暂停', () => this.player.togglePlayback().catch(error => this.player.events.emit('error', error)));
+        this.playButton.classList.add('tesla-control-primary');
+        this.stopButton = button('■', '停止', () => this.player.stop());
+        this.progress = document.createElement('input');
+        this.progress.className = 'tesla-control-progress';
+        this.progress.type = 'range';
+        this.progress.min = '0';
+        this.progress.max = '1';
+        this.progress.step = '0.01';
+        this.progress.value = '0';
+        this.progress.setAttribute('aria-label', '播放进度');
+        this.progress.addEventListener('pointerdown', () => { this.scrubbing = true; });
+        this.progress.addEventListener('input', () => this.updateTimePreview());
+        this.progress.addEventListener('change', () => {
+            this.scrubbing = false;
+            this.player.seek(Number(this.progress.value));
+        });
+        this.time = document.createElement('span');
+        this.time.className = 'tesla-control-time';
+        this.time.textContent = '0:00 / 0:00';
+        this.muteButton = button('🔊', '静音', () => this.toggleMute());
+        this.volume = document.createElement('input');
+        this.volume.className = 'tesla-control-volume';
+        this.volume.type = 'range';
+        this.volume.min = '0';
+        this.volume.max = '1';
+        this.volume.step = '0.01';
+        this.volume.value = String(this.player.getVolume());
+        this.volume.setAttribute('aria-label', '音量');
+        this.volume.addEventListener('input', () => {
+            const value = Number(this.volume.value);
+            if (value > 0)
+                this.previousVolume = value;
+            this.player.setVolume(value);
+            this.updateVolumeIcon(value);
+        });
+        const screenshot = button('◉', '截图', () => {
+            const url = this.player.screenshot();
+            if (!url)
+                return;
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = `tesla-frame-${Date.now()}.png`;
+            link.click();
+        });
+        screenshot.classList.add('tesla-control-optional');
+        const fullscreen = button('⛶', '全屏', () => this.player.fullscreen());
+        const spacer = document.createElement('span');
+        spacer.className = 'tesla-control-spacer';
+        this.element.append(this.stateLabel, this.playButton, this.stopButton, this.progress, this.time, spacer, this.muteButton, this.volume, screenshot, fullscreen);
+        this.unsubscribe = this.player.on('state', () => this.refresh());
+        this.timer = window.setInterval(() => this.refresh(), 250);
+        this.container.addEventListener('pointermove', this.showTemporarily, { passive: true });
+        this.container.addEventListener('pointerdown', this.showTemporarily, { passive: true });
+        this.container.addEventListener('touchstart', this.showTemporarily, { passive: true });
+        this.container.addEventListener('focusin', this.showTemporarily);
+        this.container.addEventListener('keydown', this.handleKeyDown);
+        this.container.addEventListener('dblclick', this.handleDoubleClick);
+        if (!this.container.hasAttribute('tabindex'))
+            this.container.tabIndex = 0;
+        this.refresh();
     }
     destroy() {
+        this.unsubscribe?.();
+        if (this.timer !== undefined)
+            clearInterval(this.timer);
+        if (this.hideTimer !== undefined)
+            clearTimeout(this.hideTimer);
+        this.container.removeEventListener('pointermove', this.showTemporarily);
+        this.container.removeEventListener('pointerdown', this.showTemporarily);
+        this.container.removeEventListener('touchstart', this.showTemporarily);
+        this.container.removeEventListener('focusin', this.showTemporarily);
+        this.container.removeEventListener('keydown', this.handleKeyDown);
+        this.container.removeEventListener('dblclick', this.handleDoubleClick);
+        if (this.originalTabIndex === null)
+            this.container.removeAttribute('tabindex');
+        else
+            this.container.setAttribute('tabindex', this.originalTabIndex);
         this.element.remove();
+    }
+    refresh() {
+        const state = this.player.getState();
+        const stats = this.player.getStats();
+        this.playButton.textContent = state === 'playing' || state === 'loading' ? '❚❚' : '▶';
+        this.playButton.title = state === 'playing' || state === 'loading' ? '暂停' : '播放';
+        this.stateLabel.textContent = state === 'loading' ? '加载中…' : state === 'error' ? '播放失败' : '';
+        this.stateLabel.hidden = state !== 'loading' && state !== 'error';
+        const duration = Number(stats.duration) || 0;
+        const current = Math.max(0, Number(stats.currentTime) || 0);
+        this.progress.disabled = duration <= 0;
+        this.progress.max = String(Math.max(1, duration));
+        if (!this.scrubbing)
+            this.progress.value = String(Math.min(current, Math.max(1, duration)));
+        if (!this.scrubbing)
+            this.time.textContent = `${formatPlayerTime(current)} / ${formatPlayerTime(duration)}`;
+        const volume = this.player.getVolume();
+        if (document.activeElement !== this.volume)
+            this.volume.value = String(volume);
+        this.updateVolumeIcon(volume);
+        this.stopButton.disabled = state === 'idle' || state === 'stopped' || state === 'destroyed';
+        if (state === 'playing')
+            this.scheduleHide();
+        else
+            this.show();
+    }
+    updateTimePreview() {
+        const stats = this.player.getStats();
+        this.time.textContent = `${formatPlayerTime(Number(this.progress.value))} / ${formatPlayerTime(stats.duration)}`;
+    }
+    toggleMute() {
+        const current = this.player.getVolume();
+        if (current > 0) {
+            this.previousVolume = current;
+            this.player.setVolume(0);
+        }
+        else {
+            this.player.setVolume(this.previousVolume || 1);
+        }
+        this.refresh();
+    }
+    updateVolumeIcon(value) {
+        this.muteButton.textContent = value <= 0 ? '🔇' : value < 0.5 ? '🔉' : '🔊';
+    }
+    show() {
+        this.element.dataset.hidden = 'false';
+        if (this.hideTimer !== undefined) {
+            clearTimeout(this.hideTimer);
+            this.hideTimer = undefined;
+        }
+    }
+    scheduleHide() {
+        if (this.hideTimer !== undefined || this.scrubbing || this.element.contains(document.activeElement))
+            return;
+        this.hideTimer = window.setTimeout(() => {
+            this.hideTimer = undefined;
+            if (this.player.getState() === 'playing' && !this.element.contains(document.activeElement)) {
+                this.element.dataset.hidden = 'true';
+            }
+        }, 2600);
+    }
+}
+function button(text, label, action) {
+    const element = document.createElement('button');
+    element.type = 'button';
+    element.textContent = text;
+    element.title = label;
+    element.setAttribute('aria-label', label);
+    element.addEventListener('click', action);
+    return element;
+}
+function ensureStyles() {
+    if (document.getElementById(STYLE_ID))
+        return;
+    const style = document.createElement('style');
+    style.id = STYLE_ID;
+    style.textContent = `
+.tesla-control-bar{position:absolute;left:0;right:0;bottom:0;z-index:30;display:flex;align-items:center;gap:8px;min-height:52px;padding:8px max(10px,env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom)) max(10px,env(safe-area-inset-left));background:linear-gradient(transparent,rgba(0,0,0,.9));color:#fff;transition:opacity .2s ease,transform .2s ease;font:13px/1.2 system-ui,-apple-system,Segoe UI,sans-serif}
+.tesla-control-bar[data-hidden="true"]{opacity:0;transform:translateY(8px);pointer-events:none}
+.tesla-control-bar button{display:grid;place-items:center;min-width:38px;height:38px;padding:0 10px;border:0;border-radius:10px;background:rgba(255,255,255,.14);color:#fff;font:600 16px/1 system-ui;cursor:pointer;backdrop-filter:blur(8px)}
+.tesla-control-bar button:hover,.tesla-control-bar button:focus-visible{background:rgba(255,255,255,.25);outline:2px solid rgba(255,255,255,.65);outline-offset:1px}
+.tesla-control-bar button:disabled{opacity:.4;cursor:default}
+.tesla-control-primary{background:#2563eb!important}
+.tesla-control-progress{flex:1 1 180px;min-width:70px;accent-color:#3b82f6}
+.tesla-control-volume{width:90px;accent-color:#3b82f6}
+.tesla-control-time{white-space:nowrap;font-variant-numeric:tabular-nums;text-shadow:0 1px 2px #000}
+.tesla-control-spacer{flex:0 0 2px}
+.tesla-control-state{position:absolute;left:50%;bottom:58px;transform:translateX(-50%);padding:7px 12px;border-radius:999px;background:rgba(0,0,0,.72);white-space:nowrap}
+@media(max-width:560px){.tesla-control-bar{gap:5px;min-height:48px;padding-top:6px}.tesla-control-bar button{min-width:36px;height:36px;padding:0 8px}.tesla-control-time,.tesla-control-optional,.tesla-control-bar>button:nth-of-type(2){display:none}.tesla-control-volume{width:62px}.tesla-control-progress{flex-basis:80px}}
+@media(pointer:coarse){.tesla-control-bar button{min-width:42px;height:42px}}
+`;
+    document.head.appendChild(style);
+}
+
+function calculateResponsivePlayerHeight(input) {
+    const width = Math.max(0, Number(input.width) || 0);
+    const viewportHeight = Math.max(0, Number(input.viewportHeight) || 0);
+    const aspectRatio = Number.isFinite(input.aspectRatio) && input.aspectRatio > 0 ? input.aspectRatio : 16 / 9;
+    const viewportRatio = Number.isFinite(input.maxViewportHeightRatio)
+        ? Math.max(0.25, Math.min(1, input.maxViewportHeightRatio))
+        : 1;
+    if (!width)
+        return 0;
+    const widthBasedHeight = width / aspectRatio;
+    const viewportCap = viewportHeight ? viewportHeight * viewportRatio : widthBasedHeight;
+    return Math.max(1, Math.floor(Math.min(widthBasedHeight, viewportCap)));
+}
+const MANAGED_STYLES = [
+    'width', 'height', 'maxWidth', 'maxHeight', 'minHeight', 'overflow', 'position',
+    'aspectRatio', 'touchAction', 'contain'
+];
+const RESPONSIVE_STYLES = [
+    'width', 'height', 'maxWidth', 'maxHeight', 'minHeight', 'aspectRatio', 'touchAction', 'contain'
+];
+class PlayerLayoutController {
+    constructor(container, options) {
+        this.container = container;
+        this.options = options;
+        this.original = new Map();
+        this.videoAspectRatio = 16 / 9;
+        this.destroyed = false;
+        this.update = () => {
+            if (this.destroyed || !this.options.responsive)
+                return;
+            const fullscreen = document.fullscreenElement === this.container;
+            if (fullscreen) {
+                this.container.style.width = '100%';
+                this.container.style.height = '100%';
+                this.container.style.maxHeight = '100dvh';
+                this.container.style.aspectRatio = 'auto';
+                return;
+            }
+            const parentWidth = this.container.parentElement?.clientWidth || 0;
+            const ownWidth = this.container.getBoundingClientRect().width || this.container.clientWidth || 0;
+            const width = parentWidth || ownWidth;
+            const viewportHeight = window.visualViewport?.height || window.innerHeight || document.documentElement.clientHeight;
+            const aspectRatio = this.options.aspectRatio === 'video' ? this.videoAspectRatio : this.options.aspectRatio;
+            const height = calculateResponsivePlayerHeight({
+                width,
+                viewportHeight,
+                aspectRatio,
+                maxViewportHeightRatio: this.options.maxViewportHeightRatio
+            });
+            if (!height)
+                return;
+            this.container.style.width = '100%';
+            this.container.style.height = `${height}px`;
+            this.container.style.maxHeight = 'calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom))';
+            this.container.style.aspectRatio = String(aspectRatio);
+        };
+        for (const property of MANAGED_STYLES)
+            this.original.set(property, container.style[property]);
+        this.applyBaseStyles();
+        this.observe();
+        this.update();
+    }
+    updateOptions(values) {
+        const wasResponsive = this.options.responsive;
+        this.options = { ...this.options, ...values };
+        if (wasResponsive && !this.options.responsive) {
+            this.restoreResponsiveStyles();
+            this.applyBaseStyles();
+            return;
+        }
+        this.applyBaseStyles();
+        this.update();
+    }
+    setVideoSize(width, height) {
+        if (width > 0 && height > 0) {
+            this.videoAspectRatio = width / height;
+            if (this.options.aspectRatio === 'video')
+                this.update();
+        }
+    }
+    destroy() {
+        if (this.destroyed)
+            return;
+        this.destroyed = true;
+        this.observer?.disconnect();
+        window.removeEventListener('resize', this.update);
+        window.removeEventListener('orientationchange', this.update);
+        window.visualViewport?.removeEventListener('resize', this.update);
+        document.removeEventListener('fullscreenchange', this.update);
+        this.restoreManagedStyles();
+    }
+    restoreManagedStyles() {
+        for (const property of MANAGED_STYLES)
+            this.container.style[property] = this.original.get(property) || '';
+    }
+    restoreResponsiveStyles() {
+        for (const property of RESPONSIVE_STYLES)
+            this.container.style[property] = this.original.get(property) || '';
+    }
+    applyBaseStyles() {
+        var _a;
+        (_a = this.container.style).position || (_a.position = 'relative');
+        this.container.style.overflow = 'hidden';
+        if (!this.options.responsive)
+            return;
+        this.container.style.maxWidth = '100%';
+        this.container.style.minHeight = '0';
+        this.container.style.touchAction = 'manipulation';
+        this.container.style.contain = 'layout paint';
+    }
+    observe() {
+        if (typeof ResizeObserver === 'function') {
+            this.observer = new ResizeObserver(() => this.update());
+            this.observer.observe(this.container.parentElement || this.container);
+        }
+        window.addEventListener('resize', this.update, { passive: true });
+        window.addEventListener('orientationchange', this.update, { passive: true });
+        window.visualViewport?.addEventListener('resize', this.update, { passive: true });
+        document.addEventListener('fullscreenchange', this.update);
     }
 }
 
@@ -1426,21 +1989,36 @@ let jessibucaLoader;
 function loadJessibuca(scriptUrl = new URL('./jessibuca.js', import.meta.url).href) {
     if (window.Jessibuca)
         return Promise.resolve();
-    if (jessibucaLoader)
-        return jessibucaLoader;
-    jessibucaLoader = new Promise((resolve, reject) => {
+    if (jessibucaLoader?.url === scriptUrl)
+        return jessibucaLoader.promise;
+    const promise = new Promise((resolve, reject) => {
         const script = document.createElement('script');
         script.src = scriptUrl;
         script.async = true;
-        script.onload = () => window.Jessibuca ? resolve() : reject(new Error('Jessibuca loaded but global constructor is missing.'));
-        script.onerror = () => reject(new Error(`Failed to load Jessibuca runtime: ${scriptUrl}`));
+        script.onload = () => {
+            if (window.Jessibuca)
+                resolve();
+            else {
+                script.remove();
+                reject(new Error('Jessibuca loaded but global constructor is missing.'));
+            }
+        };
+        script.onerror = () => {
+            script.remove();
+            reject(new Error(`Failed to load Jessibuca runtime: ${scriptUrl}`));
+        };
         document.head.appendChild(script);
+    }).catch(error => {
+        if (jessibucaLoader?.url === scriptUrl)
+            jessibucaLoader = undefined;
+        throw error;
     });
-    return jessibucaLoader;
+    jessibucaLoader = { url: scriptUrl, promise };
+    return promise;
 }
 class TeslaPlayer {
     constructor(containerOrOptions, maybeOptions = {}) {
-        var _a, _b;
+        var _a;
         this.events = new PlayerEvents();
         this.state = new PlayerStateMachine();
         this.guard = new NoVideoGuard();
@@ -1452,16 +2030,22 @@ class TeslaPlayer {
         this.volume = 1;
         this.handlers = [];
         this.reconnectAttempts = 0;
+        this.videoWidth = 0;
+        this.videoHeight = 0;
         this.on = this.events.on.bind(this.events);
         this.off = this.events.off.bind(this.events);
-        const supplied = containerOrOptions instanceof HTMLElement
+        const supplied = typeof HTMLElement !== 'undefined' && containerOrOptions instanceof HTMLElement
             ? { ...maybeOptions, container: containerOrOptions }
             : containerOrOptions;
         this.options = normalizePlayerOptions(supplied);
         if (!this.options.container)
             throw new Error('createTeslaPlayer requires a container element.');
-        (_a = this.options.container.style).position || (_a.position = 'relative');
-        (_b = this.options.container.style).background || (_b.background = '#000');
+        (_a = this.options.container.style).background || (_a.background = '#000');
+        this.layout = new PlayerLayoutController(this.options.container, {
+            responsive: this.options.responsive !== false,
+            aspectRatio: this.options.aspectRatio ?? 16 / 9,
+            maxViewportHeightRatio: this.options.maxViewportHeightRatio ?? 1
+        });
         this.stats = new PlayerStatsTracker(this.options.container);
         this.volume = this.options.volume ?? 1;
         this.guard.start(count => this.fail(new Error(`video elements are forbidden, found ${count}.`)), this.options.container);
@@ -1476,10 +2060,23 @@ class TeslaPlayer {
     load(url, options = {}) {
         if (this.state.current === 'destroyed')
             throw new Error('Cannot load media after destroy().');
+        this.clearReconnectTimer();
+        if (this.activeEngine !== 'none') {
+            this.stopActiveEngine();
+            this.activeEngine = 'none';
+            this.transitionState('stopped');
+        }
         this.url = url;
         this.options = normalizePlayerOptions({ ...this.options, ...options, container: this.options.container });
         this.sourceType = options.sourceType || inferSourceType(url);
+        this.videoWidth = 0;
+        this.videoHeight = 0;
         this.volume = this.options.volume ?? this.volume;
+        this.layout.updateOptions({
+            responsive: this.options.responsive !== false,
+            aspectRatio: this.options.aspectRatio ?? 16 / 9,
+            maxViewportHeightRatio: this.options.maxViewportHeightRatio ?? 1
+        });
         this.stats.resetSession({ sourceType: this.sourceType, lastError: '' });
         this.applyWebCodecsOptions();
         this.jess?.setVolume(this.volume);
@@ -1488,8 +2085,16 @@ class TeslaPlayer {
         this.syncControls();
     }
     async play(url, options = {}) {
+        if (!url && Object.keys(options).length === 0 && this.state.current === 'paused') {
+            await this.resume();
+            return;
+        }
+        if (!url && Object.keys(options).length === 0 && this.state.current === 'playing')
+            return;
         if (url)
             this.load(url, options);
+        else if (Object.keys(options).length > 0)
+            this.updateSettings(options);
         if (!this.url)
             throw new Error('Playback URL is required.');
         if (this.state.current === 'destroyed')
@@ -1499,32 +2104,45 @@ class TeslaPlayer {
         await this.playCurrent(false);
     }
     pause() {
-        if (this.activeEngine === 'webcodecs')
+        if (this.state.current !== 'playing' && this.state.current !== 'loading')
+            return;
+        if (this.activeEngine === 'webcodecs') {
             this.hls?.pause();
-        else if (this.activeEngine === 'h265web')
+            return;
+        }
+        if (this.activeEngine === 'h265web')
             this.h265?.pause();
         else if (this.activeEngine === 'jessibuca')
             this.jess?.pause().catch(error => this.handlePlaybackError(normalizeError(error)));
         else
             return;
-        this.state.transition('paused');
-        this.events.emit('state', this.state.current);
+        this.transitionState('paused');
     }
     async resume() {
-        if (this.activeEngine === 'webcodecs')
+        if (this.state.current !== 'paused')
+            return;
+        if (this.activeEngine === 'webcodecs') {
             await this.hls?.resume();
-        else if (this.activeEngine === 'h265web')
-            await this.h265?.play(this.url);
+            return;
+        }
+        if (this.activeEngine === 'h265web')
+            this.h265?.resume();
         else if (this.activeEngine === 'jessibuca')
             await this.jess?.play();
+        if (this.getState() !== 'destroyed') {
+            this.transitionState('playing');
+        }
     }
     stop() {
+        if (this.state.current === 'destroyed')
+            return;
         this.clearReconnectTimer();
         this.reconnectAttempts = 0;
         this.stopActiveEngine();
         this.activeEngine = 'none';
-        this.state.transition('stopped');
-        this.events.emit('state', this.state.current);
+        if (this.state.current !== 'stopped') {
+            this.transitionState('stopped');
+        }
     }
     destroy() {
         if (this.state.current === 'destroyed')
@@ -1537,10 +2155,43 @@ class TeslaPlayer {
         this.h265 = undefined;
         this.controlBar?.destroy();
         this.controlBar = undefined;
+        this.layout.destroy();
         this.activeEngine = 'none';
         this.guard.stop();
         this.state.transition('destroyed');
         this.events.clear();
+    }
+    async togglePlayback() {
+        if (this.state.current === 'paused')
+            await this.resume();
+        else if (this.state.current === 'playing' || this.state.current === 'loading')
+            this.pause();
+        else
+            await this.play();
+    }
+    getVolume() {
+        return this.volume;
+    }
+    getContainer() {
+        return this.options.container;
+    }
+    setRenderer(renderer) {
+        this.options.renderer = renderer;
+        this.applyWebCodecsOptions();
+    }
+    updateSettings(options) {
+        this.options = normalizePlayerOptions({ ...this.options, ...options, container: this.options.container });
+        this.layout.updateOptions({
+            responsive: this.options.responsive !== false,
+            aspectRatio: this.options.aspectRatio ?? 16 / 9,
+            maxViewportHeightRatio: this.options.maxViewportHeightRatio ?? 1
+        });
+        this.volume = this.options.volume ?? this.volume;
+        this.jess?.setVolume(this.volume);
+        this.hls?.setVolume(this.volume);
+        this.h265?.setVolume(this.volume);
+        this.applyWebCodecsOptions();
+        this.syncControls();
     }
     seek(time) {
         if (this.activeEngine === 'webcodecs' && (this.sourceType === 'mp4' || this.sourceType === 'hls')) {
@@ -1649,13 +2300,9 @@ class TeslaPlayer {
             debug: !!this.options.debug,
             loadingText: this.options.loadingText || 'loading',
             showBandwidth: true,
-            operateBtns: this.options.controls ? {
-                fullscreen: true,
-                screenshot: true,
-                play: true,
-                audio: true,
-                record: false
-            } : {
+            // TeslaPlayer renders one consistent control bar for every engine.
+            // Keeping Jessibuca's built-in controls enabled would create two stacked UIs.
+            operateBtns: {
                 fullscreen: false,
                 screenshot: false,
                 play: false,
@@ -1674,8 +2321,7 @@ class TeslaPlayer {
         this.activeEngine = 'jessibuca';
         this.firstFrameStart = performance.now();
         this.firstFrameSeen = false;
-        this.state.transition('loading');
-        this.events.emit('state', this.state.current);
+        this.transitionState('loading');
         this.syncControls();
         await this.jess.play(this.url);
     }
@@ -1703,8 +2349,9 @@ class TeslaPlayer {
         if (!this.h265)
             this.h265 = new H265WebEngine(this.options.container, this.options);
         this.activeEngine = 'h265web';
-        this.state.transition('loading');
-        this.events.emit('state', this.state.current);
+        this.firstFrameStart = performance.now();
+        this.firstFrameSeen = false;
+        this.transitionState('loading');
         this.syncControls();
         try {
             await this.h265.play(this.url);
@@ -1749,12 +2396,13 @@ class TeslaPlayer {
         }
     }
     bindHlsEvents(engine) {
-        engine.events.on('state', state => {
-            this.state.transition(state);
-            this.events.emit('state', this.state.current);
-        });
-        engine.events.on('error', error => this.handlePlaybackError(error));
+        engine.events.on('state', state => this.transitionState(state));
+        engine.events.on('error', error => this.handlePlaybackError(error, true));
         engine.events.on('log', message => this.events.emit('log', message));
+        engine.events.on('videoSize', size => {
+            this.layout.setVideoSize(size.width, size.height);
+            this.events.emit('videoSize', size);
+        });
         engine.events.on('firstFrame', ms => {
             this.reconnectAttempts = 0;
             this.stats.patch({ firstFrameTimeMs: ms, lastError: '' });
@@ -1771,7 +2419,18 @@ class TeslaPlayer {
         bind('play', () => this.markPlaying());
         bind('error', (error) => this.handlePlaybackError(new Error(typeof error === 'string' ? error : JSON.stringify(error))));
         bind('timeout', (payload) => this.handlePlaybackError(new Error(`Jessibuca timeout: ${JSON.stringify(payload)}`)));
-        bind('videoInfo', (info) => this.events.emit('log', `Video ${info?.encType || ''} ${info?.width || 0}x${info?.height || 0}`));
+        bind('videoInfo', (info) => {
+            const width = Number(info?.width) || 0;
+            const height = Number(info?.height) || 0;
+            if (width > 0 && height > 0 && (width !== this.videoWidth || height !== this.videoHeight)) {
+                this.videoWidth = width;
+                this.videoHeight = height;
+                const size = { width, height, aspectRatio: width / height };
+                this.layout.setVideoSize(width, height);
+                this.events.emit('videoSize', size);
+            }
+            this.events.emit('log', `Video ${info?.encType || ''} ${width}x${height}`);
+        });
         bind('audioInfo', (info) => this.events.emit('log', `Audio ${info?.encType || ''} ${info?.sampleRate || 0}Hz/${info?.channels || 0}ch`));
         bind('stats', (payload) => {
             const stats = typeof payload === 'string' ? safeJson(payload) : payload || {};
@@ -1800,27 +2459,26 @@ class TeslaPlayer {
             this.stats.patch({ firstFrameTimeMs });
             this.events.emit('firstFrame', firstFrameTimeMs);
         }
-        this.state.transition('playing');
-        this.events.emit('state', this.state.current);
+        this.transitionState('playing');
     }
-    handlePlaybackError(error) {
+    handlePlaybackError(error, engineAlreadyStopped = false) {
         if (this.state.current === 'destroyed' || this.reconnectTimer !== undefined)
             return;
         const canReconnect = this.options.reconnect !== false
             && (this.sourceType === 'http-flv' || this.sourceType === 'ws-flv' || this.sourceType === 'hls')
             && this.reconnectAttempts < (this.options.reconnectMaxRetries ?? 3);
         if (!canReconnect) {
-            this.fail(error);
+            this.fail(error, engineAlreadyStopped);
             return;
         }
-        this.stopActiveEngine();
+        if (!engineAlreadyStopped)
+            this.stopActiveEngine();
         this.activeEngine = 'none';
         this.reconnectAttempts += 1;
         this.stats.incrementReconnect();
         this.stats.patch({ lastError: error.message });
         this.events.emit('reconnect', this.reconnectAttempts);
-        this.state.transition('loading');
-        this.events.emit('state', this.state.current);
+        this.transitionState('loading');
         const delay = (this.options.reconnectDelayMs ?? 1000) * this.reconnectAttempts;
         this.clearReconnectTimer();
         this.reconnectTimer = window.setTimeout(() => {
@@ -1854,15 +2512,21 @@ class TeslaPlayer {
             this.reconnectTimer = undefined;
         }
     }
-    fail(error) {
+    transitionState(next) {
+        if (this.state.current === next)
+            return;
+        this.state.transition(next);
+        this.events.emit('state', this.state.current);
+    }
+    fail(error, engineAlreadyStopped = false) {
         if (this.state.current === 'destroyed')
             return;
         this.clearReconnectTimer();
-        this.stopActiveEngine();
+        if (!engineAlreadyStopped)
+            this.stopActiveEngine();
         this.activeEngine = 'none';
-        this.state.transition('error');
         this.stats.patch({ lastError: error.message });
-        this.events.emit('state', this.state.current);
+        this.transitionState('error');
         this.events.emit('error', error);
     }
 }

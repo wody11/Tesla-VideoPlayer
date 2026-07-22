@@ -18,8 +18,10 @@ The project also vendors the Jessibuca runtime for FLV software decoding when
 - Session/generation isolation for rapid source switching and stale callbacks.
 - Bounded compressed, decoder, render, and audio queues.
 - Shared reconnect policy for FLV and HLS.
-- Optional built-in controls, screenshots, fullscreen, runtime stats, and a
+- Responsive width-first sizing with a visual-viewport height cap, including portrait video.
+- Unified mobile-friendly controls, keyboard shortcuts, screenshots, fullscreen, runtime stats, and a
   container-scoped no-video guard.
+- Continuous WebAudio scheduling with bounded queues, explicit planar-float conversion, and click-free timeline resets.
 
 ## Playback routes
 
@@ -79,7 +81,10 @@ const player = createTeslaPlayer(container, {
   volume: 0.8,
   reconnect: true,
   reconnectMaxRetries: 3,
-  reconnectDelayMs: 1000
+  reconnectDelayMs: 1000,
+  responsive: true,
+  aspectRatio: 'video',
+  maxViewportHeightRatio: 0.9
 });
 
 player.on('state', state => console.log('state', state));
@@ -99,12 +104,13 @@ Main methods:
 
 - `load(url, options?)`
 - `play(url?, options?)`
-- `pause()` / `resume()` / `stop()` / `destroy()`
+- `pause()` / `resume()` / `togglePlayback()` / `stop()` / `destroy()`
 - `seek(seconds)` for MP4 and HLS VOD
-- `setVolume(0..1)`
+- `setVolume(0..1)` / `getVolume()`
 - `screenshot()`
 - `fullscreen()`
-- `getState()` / `getStats()`
+- `getState()` / `getStats()` / `getContainer()`
+- `setRenderer()` / `updateSettings()`
 - `on(event, listener)` / `off(event, listener)`
 
 `setPlaybackRate()` currently reports an unsupported-operation log and does not

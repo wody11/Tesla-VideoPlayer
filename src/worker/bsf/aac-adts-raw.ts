@@ -1,7 +1,7 @@
-// AAC ADTS -> RAW 解析工具
-// 负责解析 ADTS 帧，输出 RAW 数据和 ASC
+// AAC ADTS -> RAW 瑙ｆ瀽宸ュ叿
+// 璐熻矗瑙ｆ瀽 ADTS 甯э紝杈撳嚭 RAW 鏁版嵁鍜?ASC
 
-export function adtsToRaw(buffer: ArrayBuffer): ArrayBuffer[] {
+export function adtsToRaw(buffer: ArrayBufferLike): ArrayBuffer[] {
   const u8 = new Uint8Array(buffer);
   const frames = parseADTSFrames(u8);
   return frames.map(f => f.slice().buffer);
@@ -20,7 +20,7 @@ export function extractASCFromADTSHeader(header: Uint8Array): Uint8Array | null 
   return asc;
 }
 
-export function extractASC(buffer: ArrayBuffer): ArrayBuffer {
+export function extractASC(buffer: ArrayBufferLike): ArrayBuffer {
   const u8 = new Uint8Array(buffer);
   // Try to find first ADTS header and build ASC from it
   for (let o = 0; o + 7 <= u8.length; o++) {

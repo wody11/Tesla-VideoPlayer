@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Responsive player, controls, and playback smoothness
+
+- Added width-first responsive sizing with visual-viewport caps and decoded-video aspect ratios.
+- Replaced temporary buttons with one mobile-friendly auto-hiding control bar shared by all engines.
+- Added VOD progress, time display, mute, volume, screenshot, fullscreen, keyboard, and touch-friendly controls.
+- Reworked WebAudio scheduling to use explicit planar-float copies, a continuous timeline, bounded startup lead, and faded resets instead of per-frame playback-rate changes.
+- Added live-audio queue trimming, audio underrun/reset/drop diagnostics, requestAnimationFrame rendering, and timestamp-ordered frame insertion.
+- Assigned monotonic durations to multiple H.264 access units carried in one TS PES and decoded PCR without signed 32-bit overflow.
+- Prevented duplicate state/video-size events, made failed runtime scripts retryable, and resumed H.265 without rebuilding the player.
+- Released WebGL shaders, buffers, textures, and programs and added context-loss restoration.
+- Added layout, audio scheduling, control formatting, and queue helper tests.
+
 ### Stability and deterministic lifecycle
 
 - Fixed AES-128 HLS double PKCS#7 unpadding.

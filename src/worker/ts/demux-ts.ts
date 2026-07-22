@@ -82,6 +82,7 @@ function firstMbInSliceIsZero(nalu: Uint8Array): boolean {
   } catch { return false; }
 }
 import { adtsToRaw, getAdtsInfo, extractASC } from '../bsf/aac-adts-raw';
+import { decodePcrTimestampUs, estimateVideoFrameDurationUs } from './timing';
 // MPEG-TS Demuxer (涓绘祦绋嬮鏋?
 // 璐熻矗閬嶅巻 TS 鍖呫€佹牎楠屽悓姝ュ瓧鑺傘€佽В鏋?PID銆佹嫾鎺?PES銆佹彁鍙?PTS/DTS锛岃緭鍑洪煶瑙嗛 ES
 
@@ -129,6 +130,9 @@ export function demuxTS(buffer: ArrayBuffer): TSSample[] {
   const lastPtsModMap: Record<number, number> = {};
   // optional: track last PCR in us for potential alignment
   let lastPcrUs: number | undefined = undefined;
+  let lastVideoPesPtsUs: number | undefined;
+  let lastVideoPesAccessUnitCount = 1;
+  let estimatedVideoFrameDurationUs = 33_333;
   let haveSentKey = false; // 浠呭湪瑙佸埌棣栦釜鍏抽敭甯у悗鍐嶅紑濮嬭緭鍑鸿棰戞牱鏈?
   function unwrapPts(pid: number, v: number): number {
     const lastPtsMod = lastPtsModMap[pid];
@@ -205,7 +209,16 @@ export function demuxTS(buffer: ArrayBuffer): TSSample[] {
       const dts = (pesPts as any)[pid + 0x100000] as number | undefined;
   const basePtsUs = Math.round(ptsUnwrapped * 1000000 / 90000);
   const baseDtsUs = dts !== undefined ? Math.round(unwrapPts(pid, dts) * 1000000 / 90000) : undefined;
-      for (const g of auList) {
+      estimatedVideoFrameDurationUs = estimateVideoFrameDurationUs(
+        lastVideoPesPtsUs,
+        basePtsUs,
+        lastVideoPesAccessUnitCount,
+        estimatedVideoFrameDurationUs
+      );
+      lastVideoPesPtsUs = basePtsUs;
+      lastVideoPesAccessUnitCount = Math.max(1, auList.length);
+      for (let accessUnitIndex = 0; accessUnitIndex < auList.length; accessUnitIndex += 1) {
+        const g = auList[accessUnitIndex];
         if (!g || g.length === 0) continue;
         const isKey = g.some(n => isIDR(n));
         // 閲嶆柊缁勮 AnnexB锛堜负姣忎釜 NALU 鍔?4 瀛楄妭璧峰鐮侊級
@@ -220,7 +233,15 @@ export function demuxTS(buffer: ArrayBuffer): TSSample[] {
           if (!haveSentKey && !isKey) {
             // 棣栧叧閿抚闂ㄧ锛氬湪閬囧埌鍏抽敭甯т箣鍓嶏紝涓嶈緭鍑鸿棰戞牱鏈?
           } else {
-            samples.push({ kind: 'video', tsUs: basePtsUs, dtsUs: baseDtsUs, durUs: 0, key: isKey, data: buf.buffer, pcrUs: lastPcrUs });
+            samples.push({
+              kind: 'video',
+              tsUs: basePtsUs + accessUnitIndex * estimatedVideoFrameDurationUs,
+              dtsUs: baseDtsUs === undefined ? undefined : baseDtsUs + accessUnitIndex * estimatedVideoFrameDurationUs,
+              durUs: estimatedVideoFrameDurationUs,
+              key: isKey,
+              data: buf.buffer,
+              pcrUs: lastPcrUs
+            });
             if (isKey && !haveSentKey) haveSentKey = true;
           }
         }
@@ -292,11 +313,7 @@ export function demuxTS(buffer: ArrayBuffer): TSSample[] {
         if (pcrFlag) {
           const p = off + 6;
           if (p + 6 <= off + 5 + afLen) {
-            const b0 = u8[p], b1 = u8[p+1], b2 = u8[p+2], b3 = u8[p+3], b4 = u8[p+4], b5 = u8[p+5];
-            const pcrBase = (b0 << 25) | (b1 << 17) | (b2 << 9) | (b3 << 1) | (b4 >> 7);
-            const pcrExt = ((b4 & 0x01) << 8) | b5;
-            const pcr27 = pcrBase * 300 + pcrExt;
-            lastPcrUs = Math.round(pcr27 / 27);
+            lastPcrUs = decodePcrTimestampUs(u8, p);
           }
         }
       }

@@ -1,7 +1,10 @@
-import { PlayerCore } from '../../src/core/player-core';
+import { TeslaPlayer, TeslaStandalonePlayer, createTeslaPlayer } from '../../src/index';
 
-// expose to window for demo page
-(window as any).PlayerCore = PlayerCore;
-try { if ((window as any).__DEMO_DEBUG) console.info('demo entry: PlayerCore exposed to window'); } catch {}
+if (typeof window !== 'undefined') {
+  (window as any).TeslaPlayer = TeslaPlayer;
+  (window as any).TeslaStandalonePlayer = TeslaStandalonePlayer;
+  (window as any).createTeslaPlayer = createTeslaPlayer;
+}
 
-export default PlayerCore;
+export { TeslaPlayer, TeslaStandalonePlayer, createTeslaPlayer };
+export default TeslaPlayer;

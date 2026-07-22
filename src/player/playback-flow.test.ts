@@ -1,4 +1,4 @@
-import { canDecodeVideo, trimLiveVideoQueue } from './playback-flow';
+import { canDecodeVideo, insertByTimestamp, trimLiveAudioQueue, trimLiveVideoQueue } from './playback-flow';
 
 describe('playback flow control', () => {
   test('stops feeding VideoDecoder when its internal queue is full', () => {
@@ -35,5 +35,20 @@ describe('playback flow control', () => {
 
     expect(trimLiveVideoQueue(queue, 3)).toBe(5);
     expect(queue).toEqual([]);
+  });
+});
+
+
+describe('audio and render queue helpers', () => {
+  test('trims stale live audio while preserving the newest window', () => {
+    const queue = Array.from({ length: 10 }, (_, index) => ({ timestamp: index * 100_000, duration: 100_000 }));
+    expect(trimLiveAudioQueue(queue, 350_000, 20)).toBe(6);
+    expect(queue.map(sample => sample.timestamp)).toEqual([600_000, 700_000, 800_000, 900_000]);
+  });
+
+  test('inserts uncommon out-of-order frames without sorting the whole queue', () => {
+    const queue = [{ timestamp: 10 }, { timestamp: 30 }];
+    insertByTimestamp(queue, { timestamp: 20 });
+    expect(queue.map(item => item.timestamp)).toEqual([10, 20, 30]);
   });
 });

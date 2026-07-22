@@ -4,7 +4,7 @@
  */
 
 export { TeslaPlayer, TeslaStandalonePlayer, createTeslaPlayer } from './player/tesla-player';
-export type { TeslaPlayerOptions, TeslaLoadOptions, TeslaDecodeMode, TeslaRenderMode, TeslaSourceType } from './player/player-options';
+export type { TeslaPlayerOptions, TeslaLoadOptions, TeslaDecodeMode, TeslaRenderMode, TeslaSourceType, TeslaFitMode, TeslaAspectRatio } from './player/player-options';
 export type { TeslaPlayerStats } from './player/player-stats';
 export { decodePesTimestamp, demuxTS } from './worker/ts/demux-ts';
 

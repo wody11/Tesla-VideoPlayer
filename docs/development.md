@@ -34,7 +34,8 @@ src/worker/       active Worker entry, protocol, FLV/HLS/MP4 demux
 src/decoder/      WebCodecs configuration and sample submission
 src/audio/        WebAudio scheduling and audio clock
 src/render/       Canvas2D and WebGL rendering
-src/control/      optional control overlay
+src/control/      unified optional control overlay
+src/ui/           responsive player layout helpers
 src/sync/         reusable queue/sync helpers
 src/utils/        capability checks, generation guard, no-video guard
 docs/             architecture, API, strategy, research notes
@@ -83,6 +84,8 @@ The Worker owns network I/O and demux. It sends typed messages from
   bounded.
 - When dropping live compressed video, restart from a keyframe.
 - Close every discarded `VideoFrame` and `AudioData`.
+- Schedule WebAudio buffers contiguously; do not correct backlog by changing each source's playback rate.
+- Use explicit `f32-planar` AudioData copies before creating AudioBuffers.
 - Release MP4Box samples after transfer.
 
 ## HLS rules
@@ -124,8 +127,10 @@ For browser smoke tests, verify at least:
 4. rapid source switching and stop during decoder configuration;
 5. HLS discontinuity with timestamp reset;
 6. no leaked `video` elements inside the player container;
-7. repeated play/stop/destroy cycles do not grow Worker, AudioContext, or frame
-   counts indefinitely.
+7. repeated play/stop/destroy cycles do not grow Worker, AudioContext, WebGL, or frame
+   counts indefinitely;
+8. portrait viewport sizing never makes the player taller than its configured visual-viewport cap;
+9. audio discontinuities and backlog recovery do not overlap sources or create audible clicks.
 
 ## Pull request checklist
 

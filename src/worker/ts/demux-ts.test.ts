@@ -1,18 +1,18 @@
-// 单元测试：demuxTS
-import { decodePesTimestamp, demuxTS, TSSample } from './demux-ts';
+import {
+  decodePesTimestamp,
+  demuxTS
+} from './demux-ts';
+import { decodePcrTimestampUs, estimateVideoFrameDurationUs } from './timing';
 
 describe('demuxTS', () => {
-  it('should parse TS stream and output Sample[]', () => {
-    // 构造伪 TS 流数据（真实测试可用实际 TS 文件片段）
-    const fakeTS = new Uint8Array(188 * 3); // 3 个空包
-    fakeTS.fill(0x47, 0, fakeTS.length); // 填充同步字节
-    const samples: TSSample[] = demuxTS(fakeTS.buffer);
-    expect(Array.isArray(samples)).toBe(true);
-    // TODO: 补充更详细断言和真实 TS 流测试
+  it('ignores packets without a valid TS payload map', () => {
+    const fakeTS = new Uint8Array(188 * 3);
+    for (let offset = 0; offset < fakeTS.length; offset += 188) fakeTS[offset] = 0x47;
+    expect(demuxTS(fakeTS.buffer)).toEqual([]);
   });
 });
 
-describe('decodePesTimestamp', () => {
+describe('MPEG clock decoding', () => {
   it('preserves PTS values above the signed 32-bit range', () => {
     const pts = 5_000_000_000;
     const encoded = new Uint8Array([
@@ -23,5 +23,27 @@ describe('decodePesTimestamp', () => {
       ((pts % 128) << 1) | 1
     ]);
     expect(decodePesTimestamp(encoded, 0)).toBe(pts);
+  });
+
+  it('decodes PCR without signed 32-bit overflow', () => {
+    const maxBase = 0x1ffffffff;
+    const extension = 299;
+    const encoded = new Uint8Array([
+      Math.floor(maxBase / 33_554_432) & 0xff,
+      Math.floor(maxBase / 131_072) & 0xff,
+      Math.floor(maxBase / 512) & 0xff,
+      Math.floor(maxBase / 2) & 0xff,
+      ((maxBase & 1) << 7) | 0x7e | ((extension >> 8) & 1),
+      extension & 0xff
+    ]);
+    expect(decodePcrTimestampUs(encoded, 0)).toBe(Math.round((maxBase * 300 + extension) / 27));
+  });
+});
+
+describe('video access-unit timing', () => {
+  it('derives a monotonic duration for multiple access units in one PES', () => {
+    expect(estimateVideoFrameDurationUs(1_000_000, 1_080_000, 2)).toBe(40_000);
+    expect(estimateVideoFrameDurationUs(undefined, 1_000_000, 1)).toBe(33_333);
+    expect(estimateVideoFrameDurationUs(1_000_000, 5_000_000, 1, 40_000)).toBe(40_000);
   });
 });

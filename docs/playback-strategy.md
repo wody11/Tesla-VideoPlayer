@@ -32,9 +32,18 @@ Explicit advanced options override or update these values.
   WebAudio duration.
 - Decode in short batches so a segment cannot monopolize the main thread.
 
+## Audio scheduling rules
+
+- Copy decoded `AudioData` explicitly as `f32-planar` before creating WebAudio buffers.
+- Keep one continuous 1× playback timeline; do not speed up individual source nodes to drain backlog.
+- Use a short preset-derived startup lead rather than filling the entire maximum queue before sound starts.
+- Detect timestamp gaps, underruns, and excessive backlog, then fade out, cancel stale nodes, rebind the media clock, and fade back in.
+- Trim stale compressed live-audio samples before they can create an unbounded decode backlog.
+
 ## Render and A/V sync rules
 
-- Sort decoded `VideoFrame` objects by presentation timestamp.
+- Split multiple H.264 access units in one TS PES onto monotonic presentation timestamps instead of assigning every frame the same PTS.
+- Sort decoded `VideoFrame` objects by presentation timestamp using ordered insertion rather than sorting the whole queue per frame.
 - Use scheduled audio time as the primary clock.
 - Use a wall-clock base only while audio is unavailable.
 - Wait for early frames, draw due frames, and close frames that exceed the late
@@ -68,6 +77,9 @@ Explicit advanced options override or update these values.
 
 ## UI rules
 
+- Responsive sizing is width-first and capped to the visual viewport so portrait pages cannot grow beyond the browser screen.
+- `aspectRatio: "video"` follows decoded dimensions after starting from a 16:9 placeholder.
+- One control overlay is shared by every engine and auto-hides while playing.
 - Controls are optional and scoped to the player container.
 - NoVideoGuard observes only that container.
 - A `video` element elsewhere on the page must not break playback.

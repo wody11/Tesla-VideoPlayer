@@ -2,11 +2,11 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <title>Tesla-VideoPlayer Standalone</title>
   <style>
     * { box-sizing: border-box; }
-    html, body { width: 100%; height: 100%; overflow: hidden; }
+    html, body { width: 100%; height: 100%; min-height: 100dvh; overflow: hidden; }
     body { margin: 0; font-family: Arial, sans-serif; background: #0f1115; color: #e8ebf0; }
     .app { display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, 360px); width: 100%; height: 100dvh; max-height: 100dvh; gap: 0; overflow: hidden; }
     .stage { display: flex; flex-direction: column; min-width: 0; min-height: 0; height: 100%; overflow: hidden; border-right: 1px solid #252936; }
@@ -23,10 +23,16 @@
     pre { margin: 0; padding: 10px; border: 1px solid #252936; background: #080a0f; border-radius: 6px; white-space: pre-wrap; font-size: 12px; }
     .log { min-height: 120px; max-height: 180px; overflow: auto; }
     @media (max-width: 860px) {
-      .app { grid-template-columns: 1fr; grid-template-rows: minmax(0, 62dvh) minmax(0, 38dvh); height: 100dvh; min-height: 0; }
-      .stage { height: 100%; border-right: 0; border-bottom: 1px solid #252936; }
-      #player { height: auto; }
-      .panel { height: auto; }
+      .app { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); height: 100dvh; min-height: 0; }
+      .stage { height: auto; min-height: 0; border-right: 0; border-bottom: 1px solid #252936; }
+      #player { flex: 0 0 auto; width: 100%; height: auto; aspect-ratio: 16 / 9; max-height: min(56dvh, calc(100dvh - 72px)); }
+      .bar { flex-wrap: nowrap; overflow-x: auto; padding-bottom: calc(10px + env(safe-area-inset-bottom)); }
+      .bar button { flex: 0 0 auto; }
+      .panel { height: auto; min-height: 0; padding-bottom: calc(12px + env(safe-area-inset-bottom)); }
+    }
+    @media (max-width: 480px) {
+      .row { grid-template-columns: 1fr; }
+      .panel { padding: 10px; }
     }
   </style>
 </head>
@@ -106,7 +112,10 @@
     let player = createTeslaPlayer(container, {
       decoderMode: document.querySelector('#decoder').value,
       renderer: document.querySelector('#renderer').value,
-      fitMode: 'contain'
+      fitMode: 'contain',
+      responsive: true,
+      aspectRatio: 'video',
+      maxViewportHeightRatio: 0.92
     });
 
     function appendLog(message) {
@@ -140,7 +149,10 @@
     document.querySelector('#play').onclick = async () => {
       const selected = selectedUrl();
       try {
-        player.stop();
+        player.updateSettings({
+          decoderMode: document.querySelector('#decoder').value,
+          renderer: document.querySelector('#renderer').value
+        });
         player.load(selected.url, { sourceType: selected.sourceType });
         await player.play();
       } catch (error) {
@@ -152,8 +164,10 @@
     document.querySelector('#stop').onclick = () => player.stop();
     document.querySelector('#fullscreen').onclick = () => player.fullscreen();
     document.querySelector('#shot').onclick = () => {
+      const url = player.screenshot();
+      if (!url) return;
       const a = document.createElement('a');
-      a.href = player.screenshot();
+      a.href = url;
       a.download = 'tesla-frame.png';
       a.click();
     };

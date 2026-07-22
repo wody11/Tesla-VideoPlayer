@@ -118,6 +118,16 @@ The pipeline has several independent limits:
 
 Every dropped or stale decoded frame is explicitly closed.
 
+## Responsive layout and controls
+
+`PlayerLayoutController` owns container sizing. It computes height from the available width, follows decoded dimensions when `aspectRatio: "video"`, and caps height against `visualViewport.height`. This keeps portrait layouts inside the visible browser area. Fullscreen bypasses the aspect calculation and fills the fullscreen viewport.
+
+One Tesla control overlay is shared by WebCodecs, Jessibuca, and experimental H.265 routes. Jessibuca's internal buttons are disabled to avoid stacked control bars.
+
+## Audio scheduling
+
+Decoded `AudioData` is copied explicitly as `f32-planar`, placed on one continuous WebAudio timeline, and scheduled with a small preset-derived startup lead. The player does not speed up and slow down every audio frame. Timestamp gaps, underruns, and excessive backlog trigger a short gain fade, cancellation of stale sources, clock rebinding, and rebuffering. This avoids overlapping buffers, edge clicks, and an audio clock that disagrees with playback rate.
+
 ## Clock and rendering
 
 Audio is the preferred media clock. Video delay is calculated against scheduled
@@ -144,7 +154,7 @@ instrumentation:
 - `videoElementCount` and `canvasCount`: DOM elements inside this player's
   container only.
 
-Additional fields cover decode/render/drop counts, queue lengths, first-frame
+Additional fields cover decode/render/drop counts, queue lengths, audio underruns/timeline resets, first-frame
 time, reconnects, discontinuities, bitrate, MP4 download progress, and last
 error.
 

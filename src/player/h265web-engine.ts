@@ -32,20 +32,33 @@ declare global {
   }
 }
 
-let h265webLoader: Promise<void> | undefined;
+let h265webLoader: { url: string; promise: Promise<void> } | undefined;
 
 function loadScript(url: string): Promise<void> {
   if (window.new265webjs) return Promise.resolve();
-  if (h265webLoader) return h265webLoader;
-  h265webLoader = new Promise((resolve, reject) => {
+  if (h265webLoader?.url === url) return h265webLoader.promise;
+  const promise = new Promise<void>((resolve, reject) => {
     const script = document.createElement('script');
     script.src = url;
     script.async = true;
-    script.onload = () => window.new265webjs ? resolve() : reject(new Error('h265web.js loaded but window.new265webjs is missing.'));
-    script.onerror = () => reject(new Error(`Failed to load h265web.js runtime: ${url}. Expected vendored asset dist/h265webjs.js is missing.`));
+    script.onload = () => {
+      if (window.new265webjs) resolve();
+      else {
+        script.remove();
+        reject(new Error('h265web.js loaded but window.new265webjs is missing.'));
+      }
+    };
+    script.onerror = () => {
+      script.remove();
+      reject(new Error(`Failed to load h265web.js runtime: ${url}. Expected vendored asset dist/h265webjs.js is missing.`));
+    };
     document.head.appendChild(script);
+  }).catch(error => {
+    if (h265webLoader?.url === url) h265webLoader = undefined;
+    throw error;
   });
-  return h265webLoader;
+  h265webLoader = { url, promise };
+  return promise;
 }
 
 export class H265WebEngine {
@@ -72,6 +85,7 @@ export class H265WebEngine {
   }
 
   pause(): void { this.instance?.pause?.(); }
+  resume(): void { this.instance?.play?.(); }
   stop(): void { this.instance?.pause?.(); }
   destroy(): void {
     this.instance?.release?.();

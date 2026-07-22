@@ -16,7 +16,9 @@ Tesla WebCodecs 链路在 Worker 中完成拉流和解封装，在主线程用 W
 - session/generation 会话隔离，快速切换时旧 Worker 和旧 Decoder 回调不会污染新会话。
 - 压缩样本、Decoder、渲染和音频队列都有边界与背压控制。
 - FLV/HLS 使用统一自动重连策略。
-- 可选控制条、截图、全屏、运行统计，以及仅作用于播放器容器的 NoVideoGuard。
+- 按可用宽度计算高度并受可视浏览器高度限制，支持横屏、竖屏和真实视频比例。
+- 统一的移动端控制栏、键盘快捷键、截图、全屏、运行统计，以及仅作用于播放器容器的 NoVideoGuard。
+- 连续 WebAudio 时间线、显式浮点平面转换、队列封顶和淡入淡出重置，降低爆音、卡顿和音画漂移。
 
 ## 播放路由
 
@@ -75,7 +77,10 @@ const player = createTeslaPlayer(container, {
   volume: 0.8,
   reconnect: true,
   reconnectMaxRetries: 3,
-  reconnectDelayMs: 1000
+  reconnectDelayMs: 1000,
+  responsive: true,
+  aspectRatio: 'video',
+  maxViewportHeightRatio: 0.9
 });
 
 player.on('state', state => console.log('状态', state));
@@ -95,12 +100,13 @@ await player.play();
 
 - `load(url, options?)`
 - `play(url?, options?)`
-- `pause()` / `resume()` / `stop()` / `destroy()`
+- `pause()` / `resume()` / `togglePlayback()` / `stop()` / `destroy()`
 - `seek(seconds)`：仅 MP4 和 HLS 点播
-- `setVolume(0..1)`
+- `setVolume(0..1)` / `getVolume()`
 - `screenshot()`
 - `fullscreen()`
-- `getState()` / `getStats()`
+- `getState()` / `getStats()` / `getContainer()`
+- `setRenderer()` / `updateSettings()`
 - `on(event, listener)` / `off(event, listener)`
 
 `setPlaybackRate()` 目前只会输出“不支持”的日志，不会真的修改播放速度。

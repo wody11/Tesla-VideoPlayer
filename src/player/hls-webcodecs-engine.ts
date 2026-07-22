@@ -9,7 +9,7 @@ import { PlayerStatsTracker, TeslaPlayerStats } from './player-stats';
 import { PLAYBACK_PRESETS, PlaybackPresetName } from './playback-strategy';
 import type { TeslaWorkerEvent } from '../worker/worker-protocol';
 import { SessionGeneration } from '../utils/session-generation';
-import { canDecodeVideo, trimLiveVideoQueue } from './playback-flow';
+import { canDecodeVideo, insertByTimestamp, trimLiveAudioQueue, trimLiveVideoQueue } from './playback-flow';
 
 // Tesla no-video engine: MP4/HLS/FLV -> worker demux -> WebCodecs -> Canvas/WebGL/WebAudio.
 export interface HlsWebCodecsEngineOptions {
@@ -52,6 +52,8 @@ export class HlsWebCodecsEngine {
   private pendingAudioSamples: Array<{ data: ArrayBuffer; timestamp: number; duration?: number }> = [];
   private videoWallClockBaseUs?: number;
   private videoWallClockBaseMs?: number;
+  private videoWidth = 0;
+  private videoHeight = 0;
   private renderQueue: Array<{ frame: any; timestamp: number }> = [];
   private renderLoopId?: number;
   private decodePumpId?: number;
@@ -118,9 +120,11 @@ export class HlsWebCodecsEngine {
     }
 
     try {
-      const audio = new WebAudioPlayer();
+      const audio = new WebAudioPlayer({
+        maxQueueMs: this.settings.audioMaxQueueMs,
+        latencyHint: audioLatencyHint(this.settings.preset)
+      });
       this.audio = audio;
-      audio.setMaxQueueMs(this.settings.audioMaxQueueMs);
       audio.resume().catch(error => {
         if (this.sessions.isCurrent(sessionId)) {
           this.events.emit('log', `AudioContext resume is pending or blocked: ${error?.message || error}`);
@@ -204,15 +208,19 @@ export class HlsWebCodecsEngine {
 
   getStats(): TeslaPlayerStats {
     const audioDiagnostics = this.audio?.diagnostics();
+    const currentTimeMs = this.currentMediaTimeMs();
     this.stats.patch({
       audioQueueMs: this.audio?.queuedMs() || 0,
       audioDecodedFrames: audioDiagnostics?.enqueuedFrames || 0,
       audioScheduledSources: audioDiagnostics?.scheduledSources || 0,
       audioFrameSamples: audioDiagnostics?.lastFrameSamples || 0,
       audioContextState: audioDiagnostics?.contextState || 'closed',
+      audioTimelineResets: audioDiagnostics?.timelineResetCount || 0,
+      audioUnderruns: audioDiagnostics?.underrunCount || 0,
+      audioStartupBufferMs: audioDiagnostics?.startupBufferMs || 0,
       videoQueueLength: this.videoQueueLength,
-      currentTimeMs: this.audio?.currentTimeMs() || 0,
-      currentTime: (this.audio?.currentTimeMs() || 0) / 1000
+      currentTimeMs,
+      currentTime: currentTimeMs / 1000
     });
     return this.stats.snapshot();
   }
@@ -278,6 +286,8 @@ export class HlsWebCodecsEngine {
     this.videoQueueLength = 0;
     this.videoWallClockBaseUs = undefined;
     this.videoWallClockBaseMs = undefined;
+    this.videoWidth = 0;
+    this.videoHeight = 0;
     this.clearDecodePump();
     this.clearRenderQueue();
     this.stats.markDiscontinuity();
@@ -337,6 +347,14 @@ export class HlsWebCodecsEngine {
       } else if (message.type === 'audio-sample') {
         if (this.sourceType === 'mp4') this.mp4PullOutstanding = Math.max(0, this.mp4PullOutstanding - 1);
         this.pendingAudioSamples.push(message);
+        if (this.sourceType !== 'mp4') {
+          const dropped = trimLiveAudioQueue(
+            this.pendingAudioSamples,
+            this.settings.audioMaxQueueMs * 2000,
+            512
+          );
+          if (dropped > 0) this.stats.markAudioDropped(dropped);
+        }
         if (this.audioConfigured) this.ensureDecodePump(sessionId);
       } else if (message.type === 'stats') {
         this.stats.patch({ videoTagCount: message.videoTagCount, audioSampleCount: message.audioTagCount });
@@ -361,9 +379,16 @@ export class HlsWebCodecsEngine {
       this.videoWallClockBaseMs = performance.now();
     }
 
+    const width = frame.displayWidth || frame.codedWidth || 0;
+    const height = frame.displayHeight || frame.codedHeight || 0;
+    if (width > 0 && height > 0 && (width !== this.videoWidth || height !== this.videoHeight)) {
+      this.videoWidth = width;
+      this.videoHeight = height;
+      this.events.emit('videoSize', { width, height, aspectRatio: width / height });
+    }
+
     this.stats.markDecoded();
-    this.renderQueue.push({ frame, timestamp });
-    this.renderQueue.sort((a, b) => a.timestamp - b.timestamp);
+    insertByTimestamp(this.renderQueue, { frame, timestamp });
     while (this.renderQueue.length > this.settings.maxRenderQueue) {
       const old = this.renderQueue.shift();
       try { old?.frame.close(); } catch {}
@@ -398,7 +423,7 @@ export class HlsWebCodecsEngine {
 
   private ensureRenderLoop(sessionId = this.sessions.current): void {
     if (!this.sessions.isCurrent(sessionId) || this.renderLoopId !== undefined) return;
-    this.renderLoopId = window.setTimeout(() => this.renderTick(sessionId), 8);
+    this.renderLoopId = requestRenderFrame(() => this.renderTick(sessionId));
   }
 
   private ensureDecodePump(sessionId = this.sessions.current, delayMs = 0): void {
@@ -427,7 +452,7 @@ export class HlsWebCodecsEngine {
     // a live segment leaves a persistent video backlog.
     let audioBudget = Math.max(4, this.settings.decodeBatchSize * 2);
     while (this.audioConfigured && audioBudget > 0 && this.pendingAudioSamples.length > 0
-      && (this.audio?.queuedMs() || 0) < this.settings.audioMaxQueueMs * 1.25
+      && (this.audio?.queuedMs() || 0) < this.settings.audioMaxQueueMs
       && (this.decoder?.audioDecodeQueueSize() || 0) < 32) {
       this.decoder?.decodeAudio(this.pendingAudioSamples.shift()!);
       audioBudget -= 1;
@@ -442,7 +467,7 @@ export class HlsWebCodecsEngine {
       this.settings.maxRenderQueue
     );
     const audioCanContinue = this.audioConfigured && this.pendingAudioSamples.length > 0
-      && (this.audio?.queuedMs() || 0) < this.settings.audioMaxQueueMs * 1.25
+      && (this.audio?.queuedMs() || 0) < this.settings.audioMaxQueueMs
       && (this.decoder?.audioDecodeQueueSize() || 0) < 32;
     if (videoCanContinue || audioCanContinue) {
       this.ensureDecodePump(sessionId);
@@ -478,12 +503,21 @@ export class HlsWebCodecsEngine {
     while (this.renderQueue.length > this.settings.maxRenderQueue) {
       const old = this.renderQueue.shift();
       try { old?.frame.close(); } catch {}
-        this.videoQueueLength = Math.max(0, this.videoQueueLength - 1);
-        this.stats.markDropped();
+      this.videoQueueLength = Math.max(0, this.videoQueueLength - 1);
+      this.stats.markDropped();
     }
 
     if (this.renderQueue.length > 0) this.ensureRenderLoop(sessionId);
     this.ensureMp4Pull();
+  }
+
+  private currentMediaTimeMs(): number {
+    const audioTime = this.audio?.currentTimeMs();
+    if (audioTime && audioTime > 0) return audioTime;
+    if (this.videoWallClockBaseUs !== undefined && this.videoWallClockBaseMs !== undefined) {
+      return Math.max(0, (this.videoWallClockBaseUs / 1000) + (performance.now() - this.videoWallClockBaseMs));
+    }
+    return 0;
   }
 
   private videoDelayMs(timestamp: number): number {
@@ -537,6 +571,8 @@ export class HlsWebCodecsEngine {
     this.mp4PullOutstanding = 0;
     this.videoWallClockBaseUs = undefined;
     this.videoWallClockBaseMs = undefined;
+    this.videoWidth = 0;
+    this.videoHeight = 0;
     this.clearDecodePump();
     this.clearRenderQueue();
     try { this.renderer.clear(); } catch {}
@@ -544,7 +580,7 @@ export class HlsWebCodecsEngine {
 
   private clearRenderQueue(): void {
     if (this.renderLoopId !== undefined) {
-      clearTimeout(this.renderLoopId);
+      cancelRenderFrame(this.renderLoopId);
       this.renderLoopId = undefined;
     }
     for (const item of this.renderQueue) {
@@ -568,4 +604,21 @@ export class HlsWebCodecsEngine {
     this.mp4PullOutstanding += count;
     this.worker.postMessage({ type: 'pull', count });
   }
+}
+
+
+function audioLatencyHint(preset: PlaybackPresetName): 'interactive' | 'balanced' | 'playback' {
+  if (preset === 'low-latency') return 'interactive';
+  if (preset === 'smooth') return 'playback';
+  return 'balanced';
+}
+
+function requestRenderFrame(callback: FrameRequestCallback): number {
+  if (typeof window.requestAnimationFrame === 'function') return window.requestAnimationFrame(callback);
+  return window.setTimeout(() => callback(performance.now()), 16);
+}
+
+function cancelRenderFrame(id: number): void {
+  if (typeof window.cancelAnimationFrame === 'function') window.cancelAnimationFrame(id);
+  else clearTimeout(id);
 }

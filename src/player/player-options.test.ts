@@ -13,7 +13,22 @@ describe('normalizePlayerOptions', () => {
       volume: 1,
       reconnect: true,
       reconnectMaxRetries: 0,
-      reconnectDelayMs: 100
+      reconnectDelayMs: 100,
+      responsive: true,
+      aspectRatio: 'video',
+      maxViewportHeightRatio: 1
+    });
+  });
+
+  it('normalizes responsive layout options', () => {
+    expect(normalizePlayerOptions({ aspectRatio: 'video', maxViewportHeightRatio: 0.1 })).toMatchObject({
+      responsive: true,
+      aspectRatio: 'video',
+      maxViewportHeightRatio: 0.25
+    });
+    expect(normalizePlayerOptions({ responsive: false, aspectRatio: -1 })).toMatchObject({
+      responsive: false,
+      aspectRatio: 16 / 9
     });
   });
 });

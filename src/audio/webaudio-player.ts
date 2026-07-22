@@ -1,4 +1,10 @@
 import { AudioClock } from './audio-clock';
+import { calculateAudioStartTime, decideAudioTimelineReset, deriveAudioStartupBufferMs } from './audio-scheduling';
+
+export interface WebAudioPlayerOptions {
+  maxQueueMs?: number;
+  latencyHint?: 'interactive' | 'balanced' | 'playback';
+}
 
 // Schedules decoded AudioData through WebAudio without using media elements.
 export class WebAudioPlayer {
@@ -7,19 +13,25 @@ export class WebAudioPlayer {
   private gain: GainNode;
   private scheduledUntil = 0;
   private sources = new Set<AudioBufferSourceNode>();
-  private targetQueueMs = 1500;
-  private hardResetQueueMs = 7000;
+  private maxQueueMs = 1500;
+  private startupBufferMs = 180;
   private enqueuedFrames = 0;
   private lastFrameSamples = 0;
   private lastTimestampUs = 0;
+  private expectedNextTimestampUs?: number;
+  private timelineResetCount = 0;
+  private underrunCount = 0;
+  private volume = 1;
+  private readonly fadeSeconds = 0.012;
 
-  constructor() {
+  constructor(options: WebAudioPlayerOptions = {}) {
     const Ctor = (window as any).AudioContext || (window as any).webkitAudioContext;
     if (!Ctor) throw new Error('WebAudio is not available.');
-    this.context = new Ctor();
+    this.context = new Ctor({ latencyHint: options.latencyHint || 'balanced' });
     this.gain = this.context.createGain();
     this.gain.gain.value = 1;
     this.gain.connect(this.context.destination);
+    this.setMaxQueueMs(options.maxQueueMs ?? 1500);
   }
 
   async resume(): Promise<void> {
@@ -31,59 +43,78 @@ export class WebAudioPlayer {
   }
 
   setVolume(value: number): void {
-    const volume = Math.max(0, Math.min(1, Number(value) || 0));
-    this.gain.gain.setValueAtTime(volume, this.context.currentTime);
+    this.volume = Math.max(0, Math.min(1, Number(value) || 0));
+    const now = this.context.currentTime;
+    const param = this.gain.gain;
+    this.holdGainAt(now);
+    param.linearRampToValueAtTime(this.volume, now + this.fadeSeconds);
   }
 
   setMaxQueueMs(value: number): void {
-    this.targetQueueMs = Math.max(300, Math.min(5000, Number(value) || 1500));
-    this.hardResetQueueMs = Math.max(this.targetQueueMs * 2, this.targetQueueMs + 1000);
+    this.maxQueueMs = Math.max(300, Math.min(5000, Number(value) || 1500));
+    this.startupBufferMs = deriveAudioStartupBufferMs(this.maxQueueMs);
   }
 
   enqueue(frame: any): void {
     if (this.context.state !== 'running') this.context.resume().catch(() => undefined);
 
-    const channels = frame.numberOfChannels || 2;
-    const frames = frame.numberOfFrames || 0;
-    const sampleRate = frame.sampleRate || this.context.sampleRate;
+    const channels = Math.max(1, frame.numberOfChannels || 2);
+    const frames = Math.max(0, frame.numberOfFrames || 0);
+    const sampleRate = Math.max(1, frame.sampleRate || this.context.sampleRate);
     const timestamp = typeof frame.timestamp === 'number' ? frame.timestamp : 0;
+    if (!frames) return;
+
     this.enqueuedFrames += 1;
     this.lastFrameSamples = frames;
     this.lastTimestampUs = timestamp;
 
-    if (this.queuedMs() > this.hardResetQueueMs) {
-      this.stopScheduledSources();
-      this.clock.reset();
-      this.scheduledUntil = this.context.currentTime + this.targetQueueMs / 1000;
+    const durationUs = (frames / sampleRate) * 1_000_000;
+    const mediaGapMs = this.expectedNextTimestampUs === undefined
+      ? 0
+      : (timestamp - this.expectedNextTimestampUs) / 1000;
+    const rawQueueMs = (this.scheduledUntil - this.context.currentTime) * 1000;
+    const resetReason = decideAudioTimelineReset({
+      queuedMs: rawQueueMs,
+      mediaGapMs,
+      maxQueueMs: this.maxQueueMs,
+      hasStarted: this.expectedNextTimestampUs !== undefined
+    });
+    if (resetReason !== 'none') {
+      if (resetReason === 'underrun') this.underrunCount += 1;
+      this.smoothTimelineReset();
     }
-
-    this.clock.bind(timestamp, Math.max(this.context.currentTime + this.targetQueueMs / 1000, this.scheduledUntil || 0));
+    const startsNewTimeline = this.expectedNextTimestampUs === undefined;
 
     const audioBuffer = this.context.createBuffer(channels, frames, sampleRate);
-    for (let ch = 0; ch < channels; ch++) {
+    for (let channel = 0; channel < channels; channel += 1) {
       const data = new Float32Array(frames);
       try {
-        frame.copyTo(data, { planeIndex: ch });
+        frame.copyTo(data, { planeIndex: channel, format: 'f32-planar' });
       } catch {
-        frame.copyTo(data);
+        frame.copyTo(data, { planeIndex: channel });
       }
-      audioBuffer.copyToChannel(data, ch);
+      audioBuffer.copyToChannel(data, channel);
+    }
+
+    const now = this.context.currentTime;
+    const when = calculateAudioStartTime(now, this.scheduledUntil, this.startupBufferMs, startsNewTimeline);
+    if (startsNewTimeline) {
+      this.clock.reset();
+      this.clock.bind(timestamp, when);
+      this.fadeInAt(when);
     }
 
     const source = this.context.createBufferSource();
     source.buffer = audioBuffer;
-    const queueMs = this.queuedMs();
-    const catchupRate = queueMs > this.targetQueueMs
-      ? Math.min(1.12, 1 + ((queueMs - this.targetQueueMs) / Math.max(this.targetQueueMs, 1)) * 0.06)
-      : 1;
-    source.playbackRate.setValueAtTime(catchupRate, this.context.currentTime);
     source.connect(this.gain);
-    const target = this.clock.targetContextTime(timestamp);
-    const when = Math.max(this.context.currentTime + 0.01, target ?? this.scheduledUntil ?? this.context.currentTime);
     source.start(when);
-    this.scheduledUntil = Math.max(this.scheduledUntil, when + audioBuffer.duration / catchupRate);
+    this.scheduledUntil = when + audioBuffer.duration;
+    this.expectedNextTimestampUs = timestamp + durationUs;
     this.sources.add(source);
-    source.onended = () => this.sources.delete(source);
+    source.onended = () => {
+      this.sources.delete(source);
+      try { source.disconnect(); } catch {}
+    };
   }
 
   queuedMs(): number {
@@ -111,34 +142,91 @@ export class WebAudioPlayer {
     scheduledSources: number;
     lastFrameSamples: number;
     lastTimestampUs: number;
+    timelineResetCount: number;
+    underrunCount: number;
+    startupBufferMs: number;
   } {
     return {
       contextState: this.context.state,
       enqueuedFrames: this.enqueuedFrames,
       scheduledSources: this.sources.size,
       lastFrameSamples: this.lastFrameSamples,
-      lastTimestampUs: this.lastTimestampUs
+      lastTimestampUs: this.lastTimestampUs,
+      timelineResetCount: this.timelineResetCount,
+      underrunCount: this.underrunCount,
+      startupBufferMs: this.startupBufferMs
     };
   }
 
-  reset(): void {
-    this.stopScheduledSources();
+  reset(smooth = true): void {
+    const now = this.context.currentTime;
+    if (smooth && this.sources.size > 0 && this.context.state !== 'closed') {
+      const fadeOutAt = now + this.fadeSeconds;
+      const fadeInAt = fadeOutAt + this.fadeSeconds;
+      const param = this.gain.gain;
+      this.holdGainAt(now);
+      param.linearRampToValueAtTime(0, fadeOutAt);
+      this.stopScheduledSources(fadeOutAt);
+      param.setValueAtTime(0, fadeOutAt);
+      param.linearRampToValueAtTime(this.volume, fadeInAt);
+      this.scheduledUntil = fadeInAt;
+      this.timelineResetCount += 1;
+    } else {
+      this.stopScheduledSources(now);
+      this.scheduledUntil = now;
+    }
     this.clock.reset();
-    this.scheduledUntil = this.context.currentTime;
+    this.expectedNextTimestampUs = undefined;
     this.enqueuedFrames = 0;
     this.lastFrameSamples = 0;
     this.lastTimestampUs = 0;
   }
 
   close(): void {
-    this.reset();
+    this.reset(false);
     this.context.close().catch(() => undefined);
   }
 
-  private stopScheduledSources(): void {
+  private smoothTimelineReset(): void {
+    const now = this.context.currentTime;
+    const fadeOutAt = now + this.fadeSeconds;
+    const fadeInAt = fadeOutAt + this.fadeSeconds;
+    const param = this.gain.gain;
+    this.holdGainAt(now);
+    param.linearRampToValueAtTime(0, fadeOutAt);
+    this.stopScheduledSources(fadeOutAt);
+    param.setValueAtTime(0, fadeOutAt);
+    param.linearRampToValueAtTime(this.volume, fadeInAt);
+    this.clock.reset();
+    this.scheduledUntil = fadeInAt + this.startupBufferMs / 1000;
+    this.expectedNextTimestampUs = undefined;
+    this.timelineResetCount += 1;
+  }
+
+  private fadeInAt(time: number): void {
+    const param = this.gain.gain;
+    param.cancelScheduledValues(time);
+    param.setValueAtTime(0, time);
+    param.linearRampToValueAtTime(this.volume, time + this.fadeSeconds);
+  }
+
+  private holdGainAt(time: number): void {
+    const param = this.gain.gain;
+    const hold = (param as any).cancelAndHoldAtTime;
+    if (typeof hold === 'function') {
+      try {
+        hold.call(param, time);
+        return;
+      } catch {}
+    }
+    const value = param.value;
+    param.cancelScheduledValues(time);
+    param.setValueAtTime(value, time);
+  }
+
+  private stopScheduledSources(stopAt: number): void {
     for (const source of this.sources) {
-      try { source.stop(); } catch {}
-      try { source.disconnect(); } catch {}
+      try { source.stop(stopAt); } catch {}
     }
     this.sources.clear();
   }

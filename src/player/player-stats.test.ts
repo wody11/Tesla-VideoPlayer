@@ -17,6 +17,13 @@ describe('PlayerStatsTracker', () => {
     });
   });
 
+  it('tracks audio drops independently', () => {
+    const stats = new PlayerStatsTracker();
+    stats.markAudioDropped(3);
+    stats.markAudioDropped(-1);
+    expect(stats.snapshot().audioDroppedSamples).toBe(3);
+  });
+
   it('resets per-session counters without carrying old playback values', () => {
     const stats = new PlayerStatsTracker();
     stats.patch({ decodedFrames: 9, droppedFrames: 3, duration: 99, lastError: 'old' });

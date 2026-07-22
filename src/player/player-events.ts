@@ -12,6 +12,7 @@ export type TeslaPlayerEventMap = {
   log: string;
   firstFrame: number;
   reconnect: number;
+  videoSize: { width: number; height: number; aspectRatio: number };
 };
 
 type Listener<T> = (payload: T) => void;

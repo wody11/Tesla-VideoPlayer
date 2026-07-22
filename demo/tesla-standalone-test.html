@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Tesla Standalone Stream Test</title>
   <style>
     html, body {
@@ -19,7 +19,7 @@
       display: grid;
       grid-template-columns: minmax(0, 1fr) 360px;
       gap: 12px;
-      height: 100vh;
+      height: 100dvh;
       padding: 12px;
       box-sizing: border-box;
     }
@@ -107,13 +107,24 @@
       font-size: 13px;
     }
     @media (max-width: 900px) {
-      html, body { overflow: auto; }
+      html, body { height: 100%; min-height: 100dvh; overflow: hidden; }
       .app {
         grid-template-columns: 1fr;
-        height: auto;
-        min-height: 100vh;
+        grid-template-rows: auto minmax(0, 1fr);
+        height: 100dvh;
+        min-height: 0;
+        gap: 8px;
+        padding: 8px;
       }
-      .viewer { height: 62vh; }
+      .viewer { height: auto; min-height: 0; grid-template-rows: auto auto; }
+      .topbar { grid-template-columns: minmax(0, 1fr) repeat(3, auto); }
+      #stage { height: auto; aspect-ratio: 16 / 9; max-height: min(54dvh, calc(100dvh - 66px)); }
+      .panel { min-height: 0; overflow: auto; padding-bottom: calc(8px + env(safe-area-inset-bottom)); }
+    }
+    @media (max-width: 560px) {
+      .topbar { grid-template-columns: minmax(0, 1fr) auto auto; }
+      #stop { display: none; }
+      fieldset { padding: 8px; }
     }
   </style>
 </head>
@@ -133,7 +144,7 @@
         <legend>Display</legend>
         <label>Renderer          <select id="renderer">
             <option value="webgl">WebGL</option>
-            <option value="canvas2d">Canvas 2D</option>
+            <option value="canvas">Canvas 2D</option>
           </select>
         </label>
         <label>Fit mode
@@ -198,7 +209,7 @@
       liveStartSegmentCount: document.getElementById('liveStartSegmentCount').valueAsNumber,
       liveSegmentBatch: document.getElementById('liveSegmentBatch').valueAsNumber
     });
-    let player = new TeslaStandalonePlayer({ container: stage, renderer: renderer.value, ...getSettings() });
+    let player = new TeslaStandalonePlayer({ container: stage, renderer: renderer.value, controls: true, responsive: true, aspectRatio: 'video', ...getSettings() });
 
     function bind(p) {
       p.on('state', value => state.textContent = value);

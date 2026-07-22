@@ -45,6 +45,9 @@ creates Canvas/control elements inside it.
 | `videoBuffer` | `number` | `0.2` | Jessibuca FLV buffer setting. |
 | `debug` | `boolean` | `false` | Jessibuca diagnostic logging. |
 | `loadingText` | `string` | `loading` | Jessibuca loading text. |
+| `responsive` | `boolean` | `true` | Sizes the container from available width and caps it to the visible browser viewport. |
+| `aspectRatio` | `number \| video` | `video` | Numeric width/height ratio, or `video` to follow decoded frame dimensions. |
+| `maxViewportHeightRatio` | `number` | `1` | Maximum fraction of the visual viewport height occupied by the player; clamped to `0.25..1`. |
 
 `TeslaLoadOptions` accepts all options above plus an explicit `sourceType`.
 
@@ -80,9 +83,9 @@ controls, renderer, and playback settings. It does not start playback.
 Optionally loads a new URL and starts the resolved engine. Calling this after
 `destroy()` throws.
 
-### `pause()` / `resume()`
+### `pause()` / `resume()` / `togglePlayback()`
 
-Pauses or resumes the active engine. `resume()` is asynchronous.
+Pauses or resumes the active engine. `resume()` and `togglePlayback()` are asynchronous. Calling `play()` with no new URL while paused also resumes the existing engine instead of rebuilding it.
 
 ### `stop()`
 
@@ -99,9 +102,9 @@ not reusable afterward.
 Available only for MP4 and HLS on-demand playback through the WebCodecs engine.
 Live HLS behavior is not guaranteed.
 
-### `setVolume(value)`
+### `setVolume(value)` / `getVolume()`
 
-Clamps the value to `0..1` and applies it to the active and future engine.
+Clamps the value to `0..1`, applies it to the active and future engine, and returns the normalized value through `getVolume()`.
 
 ### `setPlaybackRate(rate)`
 
@@ -116,9 +119,13 @@ Jessibuca for a base64 screenshot. Returns an empty string when unavailable.
 
 Toggles Fullscreen API state for the player container.
 
-### `getState()` / `getStats()`
+### `getState()` / `getStats()` / `getContainer()`
 
-Returns the current state string or a snapshot of `TeslaPlayerStats`.
+Returns the current state, a `TeslaPlayerStats` snapshot, or the owned container.
+
+### `setRenderer(renderer)` / `updateSettings(options)`
+
+Changes the WebCodecs renderer or reapplies normalized runtime options without creating a new public player instance. Responsive layout, volume, controls, presets, and queue limits update immediately where supported.
 
 ## Events
 
@@ -129,6 +136,7 @@ player.on('stats', stats => {});
 player.on('log', message => {});
 player.on('firstFrame', milliseconds => {});
 player.on('reconnect', attempt => {});
+player.on('videoSize', ({ width, height, aspectRatio }) => {});
 ```
 
 `on()` returns an unsubscribe function. External listener exceptions are caught
@@ -147,9 +155,16 @@ required by the application.
 - queues and clock: `audioQueueMs`, `videoQueueLength`, `currentTime`,
   `currentTimeMs`, `duration`;
 - audio diagnostics: `audioDecodedFrames`, `audioScheduledSources`,
-  `audioFrameSamples`, `audioContextState`;
+  `audioFrameSamples`, `audioContextState`, `audioTimelineResets`,
+  `audioUnderruns`, `audioStartupBufferMs`, `audioDroppedSamples`;
 - transport/recovery: `bitrate`, `reconnectCount`, `discontinuityCount`,
   `downloadedBytes`, `totalBytes`, `lastError`.
 
 Stats reset when a new media session is loaded or started. DOM counts are scoped
 to the current player container rather than the whole document.
+
+## Responsive layout and controls
+
+With `responsive: true`, player height is derived from available width, then capped by the visual viewport. This prevents a portrait page or portrait source from stretching beyond the browser screen. `aspectRatio: "video"` starts at 16:9 and switches to the first decoded video dimensions. Fullscreen temporarily fills the fullscreen viewport.
+
+The unified control bar is used for every engine, so Jessibuca's internal buttons are disabled to prevent duplicate overlays. Controls auto-hide during playback and support Space/K (play/pause), M (mute), F (fullscreen), Left/Right (seek five seconds for VOD), and double-click fullscreen.

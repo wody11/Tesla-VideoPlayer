@@ -18,6 +18,7 @@ import { HlsWebCodecsEngine, HlsWebCodecsEngineOptions } from './hls-webcodecs-e
 import { H265WebEngine } from './h265web-engine';
 import { resolveEngineRoute } from './engine-routing';
 import { ControlBar } from '../control/control-bar';
+import { PlayerLayoutController } from '../ui/player-layout';
 
 type JessibucaInstance = {
   play(url?: string, options?: any): Promise<void>;
@@ -36,20 +37,33 @@ declare global {
   }
 }
 
-let jessibucaLoader: Promise<void> | undefined;
+let jessibucaLoader: { url: string; promise: Promise<void> } | undefined;
 
 function loadJessibuca(scriptUrl = new URL('./jessibuca.js', import.meta.url).href): Promise<void> {
   if (window.Jessibuca) return Promise.resolve();
-  if (jessibucaLoader) return jessibucaLoader;
-  jessibucaLoader = new Promise((resolve, reject) => {
+  if (jessibucaLoader?.url === scriptUrl) return jessibucaLoader.promise;
+  const promise = new Promise<void>((resolve, reject) => {
     const script = document.createElement('script');
     script.src = scriptUrl;
     script.async = true;
-    script.onload = () => window.Jessibuca ? resolve() : reject(new Error('Jessibuca loaded but global constructor is missing.'));
-    script.onerror = () => reject(new Error(`Failed to load Jessibuca runtime: ${scriptUrl}`));
+    script.onload = () => {
+      if (window.Jessibuca) resolve();
+      else {
+        script.remove();
+        reject(new Error('Jessibuca loaded but global constructor is missing.'));
+      }
+    };
+    script.onerror = () => {
+      script.remove();
+      reject(new Error(`Failed to load Jessibuca runtime: ${scriptUrl}`));
+    };
     document.head.appendChild(script);
+  }).catch(error => {
+    if (jessibucaLoader?.url === scriptUrl) jessibucaLoader = undefined;
+    throw error;
   });
-  return jessibucaLoader;
+  jessibucaLoader = { url: scriptUrl, promise };
+  return promise;
 }
 
 export class TeslaPlayer {
@@ -61,6 +75,7 @@ export class TeslaPlayer {
   private hls?: HlsWebCodecsEngine;
   private h265?: H265WebEngine;
   private controlBar?: ControlBar;
+  private layout: PlayerLayoutController;
   private activeEngine: 'jessibuca' | 'webcodecs' | 'h265web' | 'none' = 'none';
   private url = '';
   private sourceType: TeslaSourceType = 'unknown';
@@ -70,16 +85,22 @@ export class TeslaPlayer {
   private handlers: Array<{ event: string; handler: (...args: any[]) => void }> = [];
   private reconnectTimer?: number;
   private reconnectAttempts = 0;
+  private videoWidth = 0;
+  private videoHeight = 0;
   private options: TeslaPlayerOptions;
 
   constructor(containerOrOptions: HTMLElement | TeslaPlayerOptions, maybeOptions: TeslaPlayerOptions = {}) {
-    const supplied = containerOrOptions instanceof HTMLElement
+    const supplied: TeslaPlayerOptions = typeof HTMLElement !== 'undefined' && containerOrOptions instanceof HTMLElement
       ? { ...maybeOptions, container: containerOrOptions }
-      : containerOrOptions;
+      : containerOrOptions as TeslaPlayerOptions;
     this.options = normalizePlayerOptions(supplied);
     if (!this.options.container) throw new Error('createTeslaPlayer requires a container element.');
-    this.options.container.style.position ||= 'relative';
     this.options.container.style.background ||= '#000';
+    this.layout = new PlayerLayoutController(this.options.container, {
+      responsive: this.options.responsive !== false,
+      aspectRatio: this.options.aspectRatio ?? 16 / 9,
+      maxViewportHeightRatio: this.options.maxViewportHeightRatio ?? 1
+    });
     this.stats = new PlayerStatsTracker(this.options.container);
     this.volume = this.options.volume ?? 1;
     this.guard.start(count => this.fail(new Error(`video elements are forbidden, found ${count}.`)), this.options.container);
@@ -97,10 +118,23 @@ export class TeslaPlayer {
 
   load(url: string, options: TeslaLoadOptions = {}): void {
     if (this.state.current === 'destroyed') throw new Error('Cannot load media after destroy().');
+    this.clearReconnectTimer();
+    if (this.activeEngine !== 'none') {
+      this.stopActiveEngine();
+      this.activeEngine = 'none';
+      this.transitionState('stopped');
+    }
     this.url = url;
     this.options = normalizePlayerOptions({ ...this.options, ...options, container: this.options.container });
     this.sourceType = options.sourceType || inferSourceType(url);
+    this.videoWidth = 0;
+    this.videoHeight = 0;
     this.volume = this.options.volume ?? this.volume;
+    this.layout.updateOptions({
+      responsive: this.options.responsive !== false,
+      aspectRatio: this.options.aspectRatio ?? 16 / 9,
+      maxViewportHeightRatio: this.options.maxViewportHeightRatio ?? 1
+    });
     this.stats.resetSession({ sourceType: this.sourceType, lastError: '' });
     this.applyWebCodecsOptions();
     this.jess?.setVolume(this.volume);
@@ -110,7 +144,13 @@ export class TeslaPlayer {
   }
 
   async play(url?: string, options: TeslaLoadOptions = {}): Promise<void> {
+    if (!url && Object.keys(options).length === 0 && this.state.current === 'paused') {
+      await this.resume();
+      return;
+    }
+    if (!url && Object.keys(options).length === 0 && this.state.current === 'playing') return;
     if (url) this.load(url, options);
+    else if (Object.keys(options).length > 0) this.updateSettings(options);
     if (!this.url) throw new Error('Playback URL is required.');
     if (this.state.current === 'destroyed') throw new Error('Cannot play media after destroy().');
     this.clearReconnectTimer();
@@ -119,27 +159,39 @@ export class TeslaPlayer {
   }
 
   pause(): void {
-    if (this.activeEngine === 'webcodecs') this.hls?.pause();
-    else if (this.activeEngine === 'h265web') this.h265?.pause();
+    if (this.state.current !== 'playing' && this.state.current !== 'loading') return;
+    if (this.activeEngine === 'webcodecs') {
+      this.hls?.pause();
+      return;
+    }
+    if (this.activeEngine === 'h265web') this.h265?.pause();
     else if (this.activeEngine === 'jessibuca') this.jess?.pause().catch(error => this.handlePlaybackError(normalizeError(error)));
     else return;
-    this.state.transition('paused');
-    this.events.emit('state', this.state.current);
+    this.transitionState('paused');
   }
 
   async resume(): Promise<void> {
-    if (this.activeEngine === 'webcodecs') await this.hls?.resume();
-    else if (this.activeEngine === 'h265web') await this.h265?.play(this.url);
+    if (this.state.current !== 'paused') return;
+    if (this.activeEngine === 'webcodecs') {
+      await this.hls?.resume();
+      return;
+    }
+    if (this.activeEngine === 'h265web') this.h265?.resume();
     else if (this.activeEngine === 'jessibuca') await this.jess?.play();
+    if (this.getState() !== 'destroyed') {
+      this.transitionState('playing');
+    }
   }
 
   stop(): void {
+    if (this.state.current === 'destroyed') return;
     this.clearReconnectTimer();
     this.reconnectAttempts = 0;
     this.stopActiveEngine();
     this.activeEngine = 'none';
-    this.state.transition('stopped');
-    this.events.emit('state', this.state.current);
+    if (this.state.current !== 'stopped') {
+      this.transitionState('stopped');
+    }
   }
 
   destroy(): void {
@@ -152,10 +204,46 @@ export class TeslaPlayer {
     this.h265 = undefined;
     this.controlBar?.destroy();
     this.controlBar = undefined;
+    this.layout.destroy();
     this.activeEngine = 'none';
     this.guard.stop();
     this.state.transition('destroyed');
     this.events.clear();
+  }
+
+
+  async togglePlayback(): Promise<void> {
+    if (this.state.current === 'paused') await this.resume();
+    else if (this.state.current === 'playing' || this.state.current === 'loading') this.pause();
+    else await this.play();
+  }
+
+  getVolume(): number {
+    return this.volume;
+  }
+
+  getContainer(): HTMLElement {
+    return this.options.container!;
+  }
+
+  setRenderer(renderer: 'canvas' | 'webgl'): void {
+    this.options.renderer = renderer;
+    this.applyWebCodecsOptions();
+  }
+
+  updateSettings(options: TeslaLoadOptions): void {
+    this.options = normalizePlayerOptions({ ...this.options, ...options, container: this.options.container });
+    this.layout.updateOptions({
+      responsive: this.options.responsive !== false,
+      aspectRatio: this.options.aspectRatio ?? 16 / 9,
+      maxViewportHeightRatio: this.options.maxViewportHeightRatio ?? 1
+    });
+    this.volume = this.options.volume ?? this.volume;
+    this.jess?.setVolume(this.volume);
+    this.hls?.setVolume(this.volume);
+    this.h265?.setVolume(this.volume);
+    this.applyWebCodecsOptions();
+    this.syncControls();
   }
 
   seek(time: number): void {
@@ -271,13 +359,9 @@ export class TeslaPlayer {
       debug: !!this.options.debug,
       loadingText: this.options.loadingText || 'loading',
       showBandwidth: true,
-      operateBtns: this.options.controls ? {
-        fullscreen: true,
-        screenshot: true,
-        play: true,
-        audio: true,
-        record: false
-      } : {
+      // TeslaPlayer renders one consistent control bar for every engine.
+      // Keeping Jessibuca's built-in controls enabled would create two stacked UIs.
+      operateBtns: {
         fullscreen: false,
         screenshot: false,
         play: false,
@@ -296,8 +380,7 @@ export class TeslaPlayer {
     this.activeEngine = 'jessibuca';
     this.firstFrameStart = performance.now();
     this.firstFrameSeen = false;
-    this.state.transition('loading');
-    this.events.emit('state', this.state.current);
+    this.transitionState('loading');
     this.syncControls();
     await this.jess.play(this.url);
   }
@@ -325,8 +408,9 @@ export class TeslaPlayer {
     this.hls = undefined;
     if (!this.h265) this.h265 = new H265WebEngine(this.options.container!, this.options);
     this.activeEngine = 'h265web';
-    this.state.transition('loading');
-    this.events.emit('state', this.state.current);
+    this.firstFrameStart = performance.now();
+    this.firstFrameSeen = false;
+    this.transitionState('loading');
     this.syncControls();
     try {
       await this.h265.play(this.url);
@@ -373,12 +457,13 @@ export class TeslaPlayer {
   }
 
   private bindHlsEvents(engine: HlsWebCodecsEngine): void {
-    engine.events.on('state', state => {
-      this.state.transition(state as any);
-      this.events.emit('state', this.state.current);
-    });
-    engine.events.on('error', error => this.handlePlaybackError(error));
+    engine.events.on('state', state => this.transitionState(state as any));
+    engine.events.on('error', error => this.handlePlaybackError(error, true));
     engine.events.on('log', message => this.events.emit('log', message));
+    engine.events.on('videoSize', size => {
+      this.layout.setVideoSize(size.width, size.height);
+      this.events.emit('videoSize', size);
+    });
     engine.events.on('firstFrame', ms => {
       this.reconnectAttempts = 0;
       this.stats.patch({ firstFrameTimeMs: ms, lastError: '' });
@@ -396,7 +481,18 @@ export class TeslaPlayer {
     bind('play', () => this.markPlaying());
     bind('error', (error: any) => this.handlePlaybackError(new Error(typeof error === 'string' ? error : JSON.stringify(error))));
     bind('timeout', (payload: any) => this.handlePlaybackError(new Error(`Jessibuca timeout: ${JSON.stringify(payload)}`)));
-    bind('videoInfo', (info: any) => this.events.emit('log', `Video ${info?.encType || ''} ${info?.width || 0}x${info?.height || 0}`));
+    bind('videoInfo', (info: any) => {
+      const width = Number(info?.width) || 0;
+      const height = Number(info?.height) || 0;
+      if (width > 0 && height > 0 && (width !== this.videoWidth || height !== this.videoHeight)) {
+        this.videoWidth = width;
+        this.videoHeight = height;
+        const size = { width, height, aspectRatio: width / height };
+        this.layout.setVideoSize(width, height);
+        this.events.emit('videoSize', size);
+      }
+      this.events.emit('log', `Video ${info?.encType || ''} ${width}x${height}`);
+    });
     bind('audioInfo', (info: any) => this.events.emit('log', `Audio ${info?.encType || ''} ${info?.sampleRate || 0}Hz/${info?.channels || 0}ch`));
     bind('stats', (payload: any) => {
       const stats = typeof payload === 'string' ? safeJson(payload) : payload || {};
@@ -425,28 +521,26 @@ export class TeslaPlayer {
       this.stats.patch({ firstFrameTimeMs });
       this.events.emit('firstFrame', firstFrameTimeMs);
     }
-    this.state.transition('playing');
-    this.events.emit('state', this.state.current);
+    this.transitionState('playing');
   }
 
-  private handlePlaybackError(error: Error): void {
+  private handlePlaybackError(error: Error, engineAlreadyStopped = false): void {
     if (this.state.current === 'destroyed' || this.reconnectTimer !== undefined) return;
     const canReconnect = this.options.reconnect !== false
       && (this.sourceType === 'http-flv' || this.sourceType === 'ws-flv' || this.sourceType === 'hls')
       && this.reconnectAttempts < (this.options.reconnectMaxRetries ?? 3);
     if (!canReconnect) {
-      this.fail(error);
+      this.fail(error, engineAlreadyStopped);
       return;
     }
 
-    this.stopActiveEngine();
+    if (!engineAlreadyStopped) this.stopActiveEngine();
     this.activeEngine = 'none';
     this.reconnectAttempts += 1;
     this.stats.incrementReconnect();
     this.stats.patch({ lastError: error.message });
     this.events.emit('reconnect', this.reconnectAttempts);
-    this.state.transition('loading');
-    this.events.emit('state', this.state.current);
+    this.transitionState('loading');
     const delay = (this.options.reconnectDelayMs ?? 1000) * this.reconnectAttempts;
     this.clearReconnectTimer();
     this.reconnectTimer = window.setTimeout(() => {
@@ -476,14 +570,19 @@ export class TeslaPlayer {
     }
   }
 
-  private fail(error: Error): void {
+  private transitionState(next: 'idle' | 'loading' | 'playing' | 'paused' | 'seeking' | 'stopped' | 'error' | 'destroyed'): void {
+    if (this.state.current === next) return;
+    this.state.transition(next);
+    this.events.emit('state', this.state.current);
+  }
+
+  private fail(error: Error, engineAlreadyStopped = false): void {
     if (this.state.current === 'destroyed') return;
     this.clearReconnectTimer();
-    this.stopActiveEngine();
+    if (!engineAlreadyStopped) this.stopActiveEngine();
     this.activeEngine = 'none';
-    this.state.transition('error');
     this.stats.patch({ lastError: error.message });
-    this.events.emit('state', this.state.current);
+    this.transitionState('error');
     this.events.emit('error', error);
   }
 }

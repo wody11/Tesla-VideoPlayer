@@ -1,5 +1,5 @@
-// AAC ADTS -> RAW 解析工具
-// 负责解析 ADTS 帧，输出 RAW 数据和 ASC
+// AAC ADTS -> RAW 瑙ｆ瀽宸ュ叿
+// 璐熻矗瑙ｆ瀽 ADTS 甯э紝杈撳嚭 RAW 鏁版嵁鍜?ASC
 function adtsToRaw(buffer) {
     const u8 = new Uint8Array(buffer);
     const frames = parseADTSFrames(u8);
@@ -61,6 +61,28 @@ function getAdtsInfo(u8) {
         return { sampleRate, channels: channelConfig };
     }
     return null;
+}
+
+// Safe MPEG clock helpers. Avoid JavaScript's signed 32-bit bitwise coercion.
+function decodePcrTimestampUs(data, offset) {
+    if (offset < 0 || offset + 6 > data.length)
+        return 0;
+    const base = data[offset] * 33554432
+        + data[offset + 1] * 131072
+        + data[offset + 2] * 512
+        + data[offset + 3] * 2
+        + (data[offset + 4] >> 7);
+    const extension = ((data[offset + 4] & 0x01) << 8) | data[offset + 5];
+    return Math.round((base * 300 + extension) / 27);
+}
+function estimateVideoFrameDurationUs(previousPesPtsUs, currentPesPtsUs, previousAccessUnitCount, fallbackUs = 33333) {
+    const fallback = Math.max(5000, Math.min(200000, Math.round(fallbackUs) || 33333));
+    if (previousPesPtsUs === undefined)
+        return fallback;
+    const candidate = (currentPesPtsUs - previousPesPtsUs) / Math.max(1, previousAccessUnitCount);
+    return Number.isFinite(candidate) && candidate >= 5000 && candidate <= 200000
+        ? Math.round(candidate)
+        : fallback;
 }
 
 // 杈呭姪锛氫粠 ES 鏁版嵁涓彁鍙?NALU锛圓nnexB 鏍煎紡锛屾敮鎸?3/4 瀛楄妭璧峰鐮侊級
@@ -197,6 +219,9 @@ function demuxTS(buffer) {
     const lastPtsModMap = {};
     // optional: track last PCR in us for potential alignment
     let lastPcrUs = undefined;
+    let lastVideoPesPtsUs;
+    let lastVideoPesAccessUnitCount = 1;
+    let estimatedVideoFrameDurationUs = 33333;
     let haveSentKey = false; // 浠呭湪瑙佸埌棣栦釜鍏抽敭甯у悗鍐嶅紑濮嬭緭鍑鸿棰戞牱鏈?
     function unwrapPts(pid, v) {
         const lastPtsMod = lastPtsModMap[pid];
@@ -282,7 +307,11 @@ function demuxTS(buffer) {
             const dts = pesPts[pid + 0x100000];
             const basePtsUs = Math.round(ptsUnwrapped * 1000000 / 90000);
             const baseDtsUs = dts !== undefined ? Math.round(unwrapPts(pid, dts) * 1000000 / 90000) : undefined;
-            for (const g of auList) {
+            estimatedVideoFrameDurationUs = estimateVideoFrameDurationUs(lastVideoPesPtsUs, basePtsUs, lastVideoPesAccessUnitCount, estimatedVideoFrameDurationUs);
+            lastVideoPesPtsUs = basePtsUs;
+            lastVideoPesAccessUnitCount = Math.max(1, auList.length);
+            for (let accessUnitIndex = 0; accessUnitIndex < auList.length; accessUnitIndex += 1) {
+                const g = auList[accessUnitIndex];
                 if (!g || g.length === 0)
                     continue;
                 const isKey = g.some(n => isIDR(n));
@@ -302,7 +331,15 @@ function demuxTS(buffer) {
                 if (buf.length >= 8) {
                     if (!haveSentKey && !isKey) ;
                     else {
-                        samples.push({ kind: 'video', tsUs: basePtsUs, dtsUs: baseDtsUs, durUs: 0, key: isKey, data: buf.buffer, pcrUs: lastPcrUs });
+                        samples.push({
+                            kind: 'video',
+                            tsUs: basePtsUs + accessUnitIndex * estimatedVideoFrameDurationUs,
+                            dtsUs: baseDtsUs === undefined ? undefined : baseDtsUs + accessUnitIndex * estimatedVideoFrameDurationUs,
+                            durUs: estimatedVideoFrameDurationUs,
+                            key: isKey,
+                            data: buf.buffer,
+                            pcrUs: lastPcrUs
+                        });
                         if (isKey && !haveSentKey)
                             haveSentKey = true;
                     }
@@ -393,11 +430,7 @@ function demuxTS(buffer) {
                 if (pcrFlag) {
                     const p = off + 6;
                     if (p + 6 <= off + 5 + afLen) {
-                        const b0 = u8[p], b1 = u8[p + 1], b2 = u8[p + 2], b3 = u8[p + 3], b4 = u8[p + 4], b5 = u8[p + 5];
-                        const pcrBase = (b0 << 25) | (b1 << 17) | (b2 << 9) | (b3 << 1) | (b4 >> 7);
-                        const pcrExt = ((b4 & 0x01) << 8) | b5;
-                        const pcr27 = pcrBase * 300 + pcrExt;
-                        lastPcrUs = Math.round(pcr27 / 27);
+                        lastPcrUs = decodePcrTimestampUs(u8, p);
                     }
                 }
             }
@@ -457,4 +490,4 @@ function demuxTS(buffer) {
 }
 
 export { demuxTS as a, decodePesTimestamp as d };
-//# sourceMappingURL=demux-ts-6eb45a7f.js.map
+//# sourceMappingURL=demux-ts-ce1f394e.js.map

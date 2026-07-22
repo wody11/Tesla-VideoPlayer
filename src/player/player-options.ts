@@ -7,6 +7,7 @@ export type TeslaSourceType = 'http-flv' | 'ws-flv' | 'hls' | 'mp4' | 'h265' | '
 export type TeslaDecodeMode = 'auto' | 'webcodecs' | 'wasm';
 export type TeslaRenderMode = 'canvas' | 'webgl';
 export type TeslaFitMode = 'contain' | 'cover' | 'fill';
+export type TeslaAspectRatio = number | 'video';
 
 export interface TeslaPlayerOptions {
   container?: HTMLElement;
@@ -35,6 +36,12 @@ export interface TeslaPlayerOptions {
   videoBuffer?: number;
   debug?: boolean;
   loadingText?: string;
+  /** Size the player from its available width and cap it to the visual viewport. */
+  responsive?: boolean;
+  /** Numeric width/height ratio, or 'video' to follow decoded frame dimensions. */
+  aspectRatio?: TeslaAspectRatio;
+  /** Fraction of the visible viewport height the player may occupy. */
+  maxViewportHeightRatio?: number;
 }
 
 export interface TeslaLoadOptions extends Partial<TeslaPlayerOptions> {
@@ -43,7 +50,7 @@ export interface TeslaLoadOptions extends Partial<TeslaPlayerOptions> {
 
 export const DEFAULT_PLAYER_OPTIONS: Readonly<Pick<TeslaPlayerOptions,
   'decoderMode' | 'renderer' | 'fitMode' | 'controls' | 'autoplay' | 'preset' | 'volume'
-  | 'reconnect' | 'reconnectMaxRetries' | 'reconnectDelayMs'>> = {
+  | 'reconnect' | 'reconnectMaxRetries' | 'reconnectDelayMs' | 'responsive' | 'aspectRatio' | 'maxViewportHeightRatio'>> = {
   decoderMode: 'auto',
   renderer: 'webgl',
   fitMode: 'contain',
@@ -53,7 +60,10 @@ export const DEFAULT_PLAYER_OPTIONS: Readonly<Pick<TeslaPlayerOptions,
   volume: 1,
   reconnect: true,
   reconnectMaxRetries: 3,
-  reconnectDelayMs: 1000
+  reconnectDelayMs: 1000,
+  responsive: true,
+  aspectRatio: 'video',
+  maxViewportHeightRatio: 1
 };
 
 export function normalizePlayerOptions(options: TeslaPlayerOptions): TeslaPlayerOptions {
@@ -62,8 +72,17 @@ export function normalizePlayerOptions(options: TeslaPlayerOptions): TeslaPlayer
     ...options,
     volume: clamp(Number(options.volume ?? DEFAULT_PLAYER_OPTIONS.volume), 0, 1),
     reconnectMaxRetries: Math.max(0, Math.floor(Number(options.reconnectMaxRetries ?? DEFAULT_PLAYER_OPTIONS.reconnectMaxRetries))),
-    reconnectDelayMs: Math.max(100, Math.floor(Number(options.reconnectDelayMs ?? DEFAULT_PLAYER_OPTIONS.reconnectDelayMs)))
+    reconnectDelayMs: Math.max(100, Math.floor(Number(options.reconnectDelayMs ?? DEFAULT_PLAYER_OPTIONS.reconnectDelayMs))),
+    responsive: options.responsive !== false,
+    aspectRatio: normalizeAspectRatio(options.aspectRatio ?? DEFAULT_PLAYER_OPTIONS.aspectRatio),
+    maxViewportHeightRatio: clamp(Number(options.maxViewportHeightRatio ?? DEFAULT_PLAYER_OPTIONS.maxViewportHeightRatio), 0.25, 1)
   };
+}
+
+function normalizeAspectRatio(value: TeslaAspectRatio): TeslaAspectRatio {
+  if (value === 'video') return value;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : 16 / 9;
 }
 
 function clamp(value: number, min: number, max: number): number {
